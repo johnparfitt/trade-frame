@@ -48,3 +48,5 @@ cd backend
 ./.venv/bin/python -m pip install -r requirements-dev.txt
 ./.venv/bin/python -m pytest
 ```
+
+pytest covers watchlist CRUD against a temp SQLite DB with yfinance mocked.

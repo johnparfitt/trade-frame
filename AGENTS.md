@@ -16,6 +16,19 @@ This is a local, single-user "single pane of glass" for stock trading.
 
 If a task seems to require one of these, stop and ask rather than adding it.
 
+## Where to put new work
+
+Do not stuff unrelated UI or types into the watchlist pane or `WatchlistRow`.
+
+- **New pane:** add `frontend/src/panes/<name>/` and one object to `PANES` in
+  `frontend/src/panes/index.ts` (path, label, Component). `App.tsx` renders
+  nav and routes from that list — do not hardcode a second pane in App.
+- **New API:** add `backend/app/api/routes/<name>.py`, include the router in
+  `backend/app/main.py`, and put request/response models in a new schema
+  module (not on `WatchlistRow` / `backend/app/schemas.py`).
+- **Watchlist-only changes:** stay inside `frontend/src/panes/watchlist/` and
+  the existing watchlist route/service/schema files.
+
 ## The watchlist metric-sync contract
 
 `SymbolSnapshot` (`backend/app/services/market_data.py`) and `WatchlistRow`
@@ -28,9 +41,9 @@ replace that with a manual per-field mapping.
 
 1. Keep `SymbolSnapshot`, backend `WatchlistRow`, and frontend `WatchlistRow`
    synchronized. `added_at` is the only field absent from `SymbolSnapshot`.
-2. Update `ALL_COLUMNS` if the metric should appear in the table. Every column
-   key must reference a valid `WatchlistRow` field, but not every field needs a
-   column.
+2. Update `ALL_COLUMNS` in `frontend/src/panes/watchlist/columns.tsx` if the
+   metric should appear in the table. Every column key must reference a valid
+   `WatchlistRow` field, but not every field needs a column.
 3. Run the backend test suite:
    ```bash
    cd backend && ./.venv/bin/python -m pytest
@@ -38,9 +51,10 @@ replace that with a manual per-field mapping.
 
 ## Watchlist UI layout invariants
 
-- The table (`frontend/src/components/Watchlist.tsx`) is `table-fixed` with
-  proportional `width` **weights** on `ALL_COLUMNS` entries, not fixed pixel
-  widths. Don't reintroduce fixed pixel widths.
+- The table (`frontend/src/panes/watchlist/WatchlistTable.tsx`) is `table-fixed`
+  with proportional `width` **weights** on `ALL_COLUMNS` entries
+  (`frontend/src/panes/watchlist/columns.tsx`), not fixed pixel widths. Don't
+  reintroduce fixed pixel widths.
 - No horizontal scrolling on the table. Long text columns (Company, Industry)
   truncate via `truncate`/`max-w-0` instead of wrapping or overflowing.
 - The sort-icon `<th>` always reserves a fixed `w-2` for the icon (visible or
@@ -60,7 +74,9 @@ replace that with a manual per-field mapping.
 
 Before considering a change finished:
 
-- Backend tests pass and you added/updated a test if you touched anything in the metric-sync contract above.
+- Backend tests pass. If you changed watchlist API behavior, add/update a test
+  in `backend/tests/test_watchlist_api.py`. If you touched the metric-sync
+  contract above, add/update a test there as well.
 - If you changed Watchlist layout or behavior, verify it in the browser
   (add/remove a symbol, sort, toggle a column). Backend tests do not
   cover the UI.

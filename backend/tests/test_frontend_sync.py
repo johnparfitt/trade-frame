@@ -2,7 +2,7 @@
 
 This is a lightweight, regex-based check (no TS toolchain in the backend test
 env) that the field names in `frontend/src/api.ts`'s `WatchlistRow` interface,
-and the column `key`s in `frontend/src/components/Watchlist.tsx`'s
+and the column `key`s in `frontend/src/panes/watchlist/columns.tsx`'s
 `ALL_COLUMNS`, are all real fields on the backend `WatchlistRow` schema. It
 won't catch every possible mismatch, but it catches the common drift: a field
 renamed/removed on the backend while the frontend still references the old
@@ -19,7 +19,7 @@ from app.schemas import WatchlistRow
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 API_TS = REPO_ROOT / "frontend" / "src" / "api.ts"
-WATCHLIST_TSX = REPO_ROOT / "frontend" / "src" / "components" / "Watchlist.tsx"
+WATCHLIST_TSX = REPO_ROOT / "frontend" / "src" / "panes" / "watchlist" / "columns.tsx"
 
 FIELD_LINE_RE = re.compile(r"^\s*(\w+)\s*:\s*.+;\s*$")
 COLUMN_KEY_RE = re.compile(r'key:\s*"(\w+)"')
@@ -62,7 +62,7 @@ def test_all_columns_keys_are_valid_watchlist_row_fields():
     backend_fields = _backend_fields()
     unknown = keys - backend_fields
     assert not unknown, (
-        f"Watchlist.tsx ALL_COLUMNS references key(s) {sorted(unknown)} that "
+        f"columns.tsx ALL_COLUMNS references key(s) {sorted(unknown)} that "
         "don't exist on the backend WatchlistRow schema. Rename/remove the "
         "column definition, or add the field to the backend."
     )
