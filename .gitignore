@@ -69,6 +69,7 @@ web_modules/
 .env
 .env.*
 !.env.example
+!backend/.env.example
 
 # Python (backend)
 .venv/
@@ -78,6 +79,9 @@ __pycache__/
 
 # Local SQLite data
 backend/data/
+
+# Local UW API response dumps
+api-samples/
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache

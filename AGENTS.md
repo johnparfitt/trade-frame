@@ -69,6 +69,16 @@ replace that with a manual per-field mapping.
   without verifying live data still fetches.
 - `TF_SNAPSHOT_CACHE_TTL` and `TF_RVOL_LOOKBACK_DAYS` are config knobs (see
   README), not values to hardcode elsewhere.
+- Unusual Whales: before calling the UW API or interpreting UW JSON, read
+  `prompts/unusual-whales/SKILL.md`. Do not invent endpoints. The API token
+  comes from env, never from the skill. Daily-report analysis prompt:
+  `prompts/unusual-whales/daily-report.md`. Product UI still follows Scope
+  (no screener).
+- Daily Market Report (Report pane) uses UW `/api/market/daily-report` analyzed
+  by an LLM with the `daily-report.md` prompt. Manual Generate button only (no
+  scheduler). Keys from env: `TF_UW_API_KEY`, `TF_ANTHROPIC_API_KEY`; model via
+  `TF_LLM_MODEL`. The LLM call is isolated in `backend/app/services/llm.py` —
+  keep provider swaps there.
 
 ## Definition of done
 

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import watchlist
+from app.api.routes import breadth, report, watchlist
 from app.config import get_settings
 from app.db.session import init_db
 
@@ -27,6 +27,8 @@ app.add_middleware(
 )
 
 app.include_router(watchlist.router)
+app.include_router(breadth.router)
+app.include_router(report.router)
 
 
 @app.get("/api/health")
