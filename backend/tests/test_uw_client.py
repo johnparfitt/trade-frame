@@ -69,6 +69,65 @@ def test_daily_report_returns_empty_dict_when_data_missing():
         client.close()
 
 
+def test_gex_levels_returns_data_object_from_the_oi_source():
+    seen: dict = {}
+    levels = {"call_wall": "210", "put_wall": "190", "gamma_magnet": "200"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"data": levels})
+
+    client = _client(handler)
+    try:
+        assert client.gex_levels("mrna") == levels
+    finally:
+        client.close()
+
+    assert "/api/stock/MRNA/gex-levels" in seen["url"]
+    # UW defaults to the volume basis; the watchlist wants open interest.
+    assert "source=oi" in seen["url"]
+
+
+def test_gex_levels_returns_empty_dict_when_data_is_not_an_object():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": ["not", "an object"]})
+
+    client = _client(handler)
+    try:
+        assert client.gex_levels("MRNA") == {}
+    finally:
+        client.close()
+
+
+def test_financials_sends_report_type_and_returns_data():
+    seen: dict = {}
+    data = {"balance_sheets": [{"ticker": "AAPL"}], "cash_flows": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"data": data})
+
+    client = _client(handler)
+    try:
+        assert client.financials("aapl") == data
+    finally:
+        client.close()
+
+    assert "/api/stock/AAPL/financials" in seen["url"]
+    assert "report_type=quarterly" in seen["url"]
+
+
+def test_financials_returns_empty_dict_when_data_is_not_an_object():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": None})
+
+    client = _client(handler)
+    try:
+        assert client.financials("AAPL") == {}
+    finally:
+        client.close()
+
+
 def test_redact_secrets_strips_bearer_token():
     raw = "error for request with header Authorization: Bearer super-secret-token"
     out = redact_secrets(raw)

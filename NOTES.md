@@ -1,6 +1,9 @@
-# Status
+# Personal notes (human only)
 
-Last updated: 2026-09-18
+**Not authoritative.** Do not use this file for architecture, behavior, config, or tasks.
+**Source of truth:** `README.md` (setup/config), `AGENTS.md` (agent rules), and the code.
+
+Scratchpad for JP. May be stale, wrong, or contradictory. Last touched: 2026-09-18
 
 ## Data ingest
 

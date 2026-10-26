@@ -74,6 +74,42 @@ replace that with a manual per-field mapping.
   comes from env, never from the skill. Daily-report analysis prompt:
   `prompts/unusual-whales/daily-report.md`. Product UI still follows Scope
   (no screener).
+- SEC EDGAR: the watchlist Dilution Risk + SEC columns come from the free
+  EDGAR APIs (`app/services/edgar.py`, filings + SEC link) — no key, but EDGAR
+  requires a descriptive `User-Agent` (config `TF_SEC_USER_AGENT`) and caps
+  callers at 10 req/s. The Dilution Risk *score* is computed in
+  `app/services/dilution.py`, which blends those EDGAR filing signals with
+  Unusual Whales financial statements (`/api/stock/{ticker}/financials`: net
+  equity issuance, share growth, cash runway) — so it also needs
+  `TF_UW_API_KEY`. Fetched on-demand during `get_snapshot` and cached
+  (`TF_SEC_CACHE_TTL`); no scheduler. Lookups never raise — a missing CIK/key
+  or an outage yields empty/partial fields so the row still renders. The score
+  is a transparent, tunable heuristic (constants in `dilution.py`), not a black
+  box; it weights what a company actually does (issuance/buybacks/burn) over
+  the mere capacity to dilute (a boilerplate shelf). `edgar.py` returns a
+  newest-first list of significant-filing *candidates* (10-K/Q, 8-K, S-1/3,
+  424B, S-8, 14A/14C, Form D); it does not itself pick the surfaced filing.
+- SEC filing significance (the watchlist `SEC` column) is in
+  `app/services/sec_significance.py`: an LLM reads the filing document and
+  returns `{score, direction, reason}` — `score` is 0-100 *magnitude* of the
+  potential move and `direction` is `bullish`/`bearish`/`neutral`. `evaluate()`
+  scans the EDGAR candidates newest-first and surfaces the newest filing that is
+  both within `TF_SEC_SIGNIFICANCE_RECENT_DAYS` (default 14; candidates are
+  newest-first, so the scan stops at the first stale one) and scoring above
+  `TF_SEC_SIGNIFICANCE_MIN` (default 50), skipping worthless ones so the column
+  stays blank on quiet days and a real filing is never hidden behind a junk one.
+  The prompt deliberately forces earnings (results, earnings-date announcements,
+  guidance) and acquirer-side M&A (unless dilutive/transformational) below the
+  threshold. Scores are cached per accession (filings are immutable; ~1 LLM call
+  per new filing) and the scan stops at the first qualifier. Resilient + never
+  raises: a missing/empty key, `TF_SEC_SIGNIFICANCE_ENABLED=false`, an outage, or
+  an unparseable response falls back to a deterministic form/8-K-item heuristic
+  (which carries a direction too). Keys from env (`TF_ANTHROPIC_API_KEY`, model
+  via `TF_LLM_MODEL`); the LLM call stays isolated in `llm.py` (`run()`).
+  On-demand during `get_snapshot`, no scheduler. Frontend surfaces it as a
+  direction-colored score (red bearish / green bullish / amber neutral) with a
+  recency dot, an unseen "look at me" pulse, and acknowledge-on-click (seen-state
+  persisted in `localStorage` by filing URL).
 - Daily Market Report (Report pane) uses UW `/api/market/daily-report` analyzed
   by an LLM with the `daily-report.md` prompt. Manual Generate button only (no
   scheduler). Keys from env: `TF_UW_API_KEY`, `TF_ANTHROPIC_API_KEY`; model via

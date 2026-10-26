@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { addSymbol, getWatchlist, removeSymbol } from "../../api";
+import { addSymbol, getWatchlist, removeSymbol, type WatchlistRow } from "../../api";
 import ColumnPicker from "./ColumnPicker";
 import WatchlistTable from "./WatchlistTable";
 import { compare, type SortDir, type SortKey } from "./sort";
@@ -32,7 +32,20 @@ export default function WatchlistPane() {
 
   const removeMutation = useMutation({
     mutationFn: (symbol: string) => removeSymbol(symbol),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["watchlist"] }),
+    onMutate: async (symbol) => {
+      await queryClient.cancelQueries({ queryKey: ["watchlist"] });
+      const previous = queryClient.getQueryData<WatchlistRow[]>(["watchlist"]);
+      const upper = symbol.trim().toUpperCase();
+      queryClient.setQueryData<WatchlistRow[]>(["watchlist"], (old) =>
+        old?.filter((r) => r.symbol !== upper) ?? [],
+      );
+      return { previous };
+    },
+    onError: (_err, _symbol, context) => {
+      if (context?.previous !== undefined) {
+        queryClient.setQueryData(["watchlist"], context.previous);
+      }
+    },
   });
 
   const rows = useMemo(() => {

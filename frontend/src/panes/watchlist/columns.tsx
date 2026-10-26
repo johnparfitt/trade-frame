@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { WatchlistRow } from "../../api";
 import type { SortKey } from "./sort";
+import { useSeenFilings } from "./useSeenFilings";
 
 export interface Column {
   key: SortKey;
@@ -77,6 +79,177 @@ function fmtPctOne(v: number | null): string {
 function fmtDaysToCover(v: number | null): string {
   if (v == null) return "—";
   return v.toFixed(1);
+}
+
+function fmtDilution(v: number | null): string {
+  if (v == null) return "—";
+  return v.toFixed(0);
+}
+
+function dilutionClass(v: number | null): string {
+  if (v == null) return "text-slate-500";
+  if (v > 66) return "text-rose-400";
+  if (v >= 34) return "text-amber-400";
+  return "text-emerald-400";
+}
+
+function significanceClass(direction: string | null, score: number | null): string {
+  // Color = direction (red bearish / green bullish / amber neutral); brightness
+  // ramps with magnitude so a big move is louder than a mild one.
+  if (score == null) return "text-slate-500";
+  const strong = score > 66;
+  switch (direction) {
+    case "bearish":
+      return strong ? "text-rose-300" : "text-rose-400";
+    case "bullish":
+      return strong ? "text-emerald-300" : "text-emerald-400";
+    default:
+      return strong ? "text-amber-300" : "text-amber-400";
+  }
+}
+
+// Shared score cell: shows a number and, on hover, renders a multi-line note as
+// a styled tooltip. A portal is used so the tooltip escapes the table's
+// `overflow-hidden` wrapper, and it appears on hover immediately (the native
+// `title` tooltip was slow/unreliable). Optionally renders the number as a link
+// and shows a leading adornment (e.g. a recency/alert dot).
+function HoverScore({
+  label,
+  colorClass,
+  note,
+  href,
+  adornment,
+  onActivate,
+}: {
+  label: ReactNode;
+  colorClass: string;
+  note: string | null;
+  href?: string;
+  adornment?: ReactNode;
+  onActivate?: () => void;
+}) {
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const lines = (note ?? "").split("\n").filter(Boolean);
+
+  function show(e: React.MouseEvent<HTMLSpanElement>) {
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = Math.min(r.right, window.innerWidth - 8);
+    setPos({ x, y: r.bottom + 4 });
+  }
+
+  const inner = (
+    <>
+      {adornment}
+      <span>{label}</span>
+    </>
+  );
+
+  return (
+    <span
+      className="inline-flex cursor-default items-center justify-end gap-1"
+      onMouseEnter={show}
+      onMouseMove={show}
+      onMouseLeave={() => setPos(null)}
+    >
+      {href ? (
+        <a
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 hover:underline"
+          onClick={onActivate}
+        >
+          {inner}
+        </a>
+      ) : (
+        inner
+      )}
+      {pos &&
+        lines.length > 0 &&
+        createPortal(
+          <div
+            className="pointer-events-none fixed z-50 max-w-xs -translate-x-full rounded-md border border-slate-700 bg-slate-900/95 px-3 py-2 text-left text-xs leading-relaxed shadow-xl"
+            style={{ left: pos.x, top: pos.y }}
+          >
+            {lines.map((line, i) => {
+              if (i === 0) {
+                return (
+                  <div key={i} className={`mb-1 font-semibold ${colorClass}`}>
+                    {line}
+                  </div>
+                );
+              }
+              const info = line.startsWith("-") || line === "No dilution signals";
+              return (
+                <div key={i} className={info ? "text-slate-500" : "text-slate-300"}>
+                  {line}
+                </div>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
+    </span>
+  );
+}
+
+// Dilution Risk cell: the point-breakdown note on hover.
+function DilutionCell({ row }: { row: WatchlistRow }) {
+  return (
+    <HoverScore
+      label={fmtDilution(row.dilution_risk)}
+      colorClass={dilutionClass(row.dilution_risk)}
+      note={row.dilution_note}
+    />
+  );
+}
+
+const RECENT_DAYS = 7;
+
+function daysSinceFiling(iso: string | null): number | null {
+  if (!iso) return null;
+  const parts = iso.split("-");
+  if (parts.length !== 3) return null;
+  const [y, m, d] = parts.map((p) => parseInt(p, 10));
+  const filed = new Date(y, m - 1, d).getTime();
+  const now = new Date();
+  const todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  return Math.round((todayMidnight - filed) / 86_400_000);
+}
+
+// SEC cell: blank unless a filing cleared the significance bar. Shows the score
+// (color-coded), a recency dot for <=7-day-old filings, and a pulsing "look at
+// me" dot while a recent filing is unseen. Clicking opens EDGAR and marks it
+// seen, calming the pulse.
+function SecCell({ row }: { row: WatchlistRow }) {
+  const { isSeen, markSeen } = useSeenFilings();
+  if (row.sec_significance == null || !row.sec_filing_url) return <>—</>;
+
+  const age = daysSinceFiling(row.sec_filing_date);
+  const recent = age != null && age >= 0 && age <= RECENT_DAYS;
+  const alerting = recent && !isSeen(row.sec_filing_url);
+
+  const dot = recent ? (
+    <span
+      className={
+        alerting
+          ? "inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400"
+          : "inline-block h-1.5 w-1.5 rounded-full bg-slate-500"
+      }
+      aria-hidden
+    />
+  ) : null;
+
+  return (
+    <HoverScore
+      label={String(row.sec_significance)}
+      colorClass={significanceClass(row.sec_significance_direction, row.sec_significance)}
+      note={row.sec_significance_note}
+      href={row.sec_filing_url}
+      adornment={dot}
+      onActivate={() => markSeen(row.sec_filing_url!)}
+    />
+  );
 }
 
 function fmtEarnings(v: string | null): { label: string; soon: boolean } {
@@ -208,6 +381,31 @@ export const ALL_COLUMNS: Column[] = [
     render: (r) => fmtDaysToCover(r.days_to_cover),
     cellClassName: () => "text-slate-300",
     title: () => "Days to Cover",
+  },
+  {
+    key: "gamma_magnet",
+    label: "Gamma Magnet",
+    numeric: true,
+    width: 92,
+    render: (r) => fmtLast(r.gamma_magnet),
+    cellClassName: () => "text-slate-300",
+    title: () => "Strike with the largest-magnitude net gamma (the strongest pin)",
+  },
+  {
+    key: "dilution_risk",
+    label: "Dilution Risk",
+    numeric: true,
+    width: 92,
+    render: (r) => <DilutionCell row={r} />,
+    cellClassName: (r) => dilutionClass(r.dilution_risk),
+  },
+  {
+    key: "sec_significance",
+    label: "SEC",
+    numeric: true,
+    width: 84,
+    render: (r) => <SecCell row={r} />,
+    cellClassName: (r) => significanceClass(r.sec_significance_direction, r.sec_significance),
   },
   {
     key: "next_earnings",

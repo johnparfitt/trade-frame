@@ -84,6 +84,9 @@ You must choose the endpoint from this list.
 - **Greeks for Each Strike & Expiry:** `/api/stock/{ticker}/greeks`
 - **"Static" Gamma Exposure (GEX) by Strike:** `/api/stock/{ticker}/greek-exposure/strike`
 - **Spot Gamma Exposure (GEX) by Strike:** `/api/stock/{ticker}/spot-exposures/strike`
+- **GEX Levels (call wall, put wall, gamma flip, gamma magnet):** `/api/stock/{ticker}/gex-levels`
+  - _Params:_ `date`, `source` (`vol` = directionalized volume, default; `oi` = open interest)
+  - _Trade-frame watchlist:_ surfaces **gamma magnet** only (`source=oi` via `app/services/gex.py`).
 - **Interpolated IV and Percentiles:** `/api/stock/{ticker}/interpolated-iv`
 - **Options Volume/PC Ratio:** `/api/stock/{ticker}/options-volume`
 - **Hottest Chains (Options Screener):** `/api/screener/option-contracts`

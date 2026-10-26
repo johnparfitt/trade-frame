@@ -26,6 +26,28 @@ class Settings(BaseSettings):
     # In-memory cache TTL (seconds) for enriched symbol snapshots
     snapshot_cache_ttl: int = 30
 
+    # In-memory cache TTL (seconds) for the watchlist gamma magnet. Longer than
+    # the snapshot TTL because each miss
+    # costs one Unusual Whales call per symbol.
+    gex_cache_ttl: int = 900
+
+    # SEC EDGAR (watchlist Dilution Risk + SEC filing columns). Free, no key,
+    # but EDGAR requires a descriptive User-Agent with contact info and caps
+    # callers at 10 req/s — set TF_SEC_USER_AGENT to your own contact.
+    sec_user_agent: str = "trade-frame/1.0 (contact: set TF_SEC_USER_AGENT)"
+    # In-memory cache TTL (seconds) for SEC EDGAR lookups. 6h by default because
+    # filings update at most daily and each miss costs 2-3 EDGAR calls per symbol.
+    sec_cache_ttl: int = 21600
+    # SEC filing significance (watchlist SEC column). An LLM reads the filing and
+    # scores it 0-100; only filings scoring above the minimum are surfaced, so the
+    # column stays blank on quiet days. Set enabled=False to use the deterministic
+    # form/8-K-item heuristic only (no LLM calls); needs TF_ANTHROPIC_API_KEY when on.
+    sec_significance_enabled: bool = True
+    sec_significance_min: int = 50
+    # Filings older than this many days are ignored (column stays blank), so the
+    # SEC column only ever surfaces a genuinely recent event.
+    sec_significance_recent_days: int = 14
+
     # Breadth pane (Massive EOD grouped daily). Empty/unset disables refresh.
     massive_api_key: str | None = None
     breadth_lookback_days: int = 90

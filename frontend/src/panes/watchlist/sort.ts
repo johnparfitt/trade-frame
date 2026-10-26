@@ -15,6 +15,9 @@ export type SortKey =
   | "float_pct"
   | "short_pct_float"
   | "days_to_cover"
+  | "gamma_magnet"
+  | "dilution_risk"
+  | "sec_significance"
   | "next_earnings";
 
 export type SortDir = "asc" | "desc";

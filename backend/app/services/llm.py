@@ -58,13 +58,18 @@ class AnthropicClient:
         return "\n".join(parts).strip()
 
 
-def analyze(
-    data: dict[str, Any],
+def run(
+    prompt: str,
     *,
     model: str | None = None,
     client: LLMClientProtocol | None = None,
 ) -> str:
-    """Run the daily-report prompt over ``data`` and return the analysis text."""
+    """Run an arbitrary prompt and return the model's text.
+
+    The single place that instantiates a provider client + enforces the key
+    check, so callers (daily report, SEC significance, ...) stay provider-
+    agnostic. Raises ``LLMError`` on a missing key or empty output.
+    """
     settings = get_settings()
     active = client
     if active is None:
@@ -73,8 +78,17 @@ def analyze(
             raise LLMError("Anthropic API key is not configured (set TF_ANTHROPIC_API_KEY).")
         active = AnthropicClient(key)
 
-    prompt = _build_message(data, load_prompt())
     text = active.analyze(prompt, model or settings.llm_model)
     if not text.strip():
         raise LLMError("LLM returned an empty analysis.")
     return text
+
+
+def analyze(
+    data: dict[str, Any],
+    *,
+    model: str | None = None,
+    client: LLMClientProtocol | None = None,
+) -> str:
+    """Run the daily-report prompt over ``data`` and return the analysis text."""
+    return run(_build_message(data, load_prompt()), model=model, client=client)

@@ -1,8 +1,10 @@
-"""yfinance-backed market data.
+"""Market data behind the watchlist.
 
 Returns a SymbolSnapshot (company, industry, % change, RVOL) for a symbol,
 with a short TTL in-memory cache so polling the watchlist doesn't refetch on
-every request. This is the only data source for Step 1 (no API keys required).
+every request. yfinance (no API key) supplies everything except the gamma
+level (`gamma_magnet`), which comes from Unusual Whales
+via `app.services.gex` and are None unless TF_UW_API_KEY is set.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from datetime import datetime, timezone
 import yfinance as yf
 
 from app.config import get_settings
+from app.services import dilution, gex
 
 settings = get_settings()
 
@@ -48,6 +51,15 @@ class SymbolSnapshot:
     float_pct: float | None = None  # floatShares / sharesOutstanding as %
     short_pct_float: float | None = None  # % of float shorted
     days_to_cover: float | None = None  # short ratio (days to cover)
+    gamma_magnet: float | None = None  # strike with the largest-magnitude net gamma (UW)
+    dilution_risk: float | None = None  # 0-100 SEC-derived dilution risk score
+    dilution_note: str | None = None  # human-readable drivers behind the score
+    sec_filing_url: str | None = None  # link to the surfaced (significant) SEC filing
+    sec_filing_form: str | None = None  # that filing's form type (e.g. "8-K")
+    sec_filing_date: str | None = None  # that filing's ISO date
+    sec_significance: int | None = None  # 0-100 LLM significance of that filing
+    sec_significance_note: str | None = None  # why it is significant (hover)
+    sec_significance_direction: str | None = None  # bullish | bearish | neutral
     error: str | None = None
 
 
@@ -306,6 +318,17 @@ def get_snapshot(symbol: str) -> SymbolSnapshot:
             snapshot.float_pct = float_pct
             snapshot.short_pct_float = short_pct_float
             snapshot.days_to_cover = days_to_cover
+            levels = gex.get_levels(symbol)
+            snapshot.gamma_magnet = levels.gamma_magnet
+            dil = dilution.get_dilution(symbol)
+            snapshot.dilution_risk = dil.dilution_risk
+            snapshot.dilution_note = dil.dilution_note
+            snapshot.sec_filing_url = dil.sec_filing_url
+            snapshot.sec_filing_form = dil.sec_filing_form
+            snapshot.sec_filing_date = dil.sec_filing_date
+            snapshot.sec_significance = dil.sec_significance
+            snapshot.sec_significance_note = dil.sec_significance_note
+            snapshot.sec_significance_direction = dil.sec_significance_direction
     except Exception as exc:  # pragma: no cover - defensive
         snapshot.error = f"Lookup failed: {exc}"
 

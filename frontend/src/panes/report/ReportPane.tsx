@@ -6,6 +6,7 @@ import ReportBody from "./ReportBody";
 export default function ReportPane() {
   const queryClient = useQueryClient();
   const [actionError, setActionError] = useState<string | null>(null);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const wasRunning = useRef(false);
 
   const reportsQuery = useQuery({
@@ -27,6 +28,7 @@ export default function ReportPane() {
     }
     if (wasRunning.current && (state === "idle" || state === "error")) {
       wasRunning.current = false;
+      setSelectedDate(null);
       void queryClient.invalidateQueries({ queryKey: ["report"] });
     }
   }, [statusQuery.data?.state, queryClient]);
@@ -44,7 +46,8 @@ export default function ReportPane() {
   const running = statusQuery.data?.state === "running" || generateMutation.isPending;
   const status = statusQuery.data;
   const reports = reportsQuery.data ?? [];
-  const latest = reports[0];
+  const selected =
+    reports.find((report) => report.session_date === selectedDate) ?? reports[0];
   const missingKey = status && (!status.has_uw_key || !status.has_llm_key);
 
   return (
@@ -64,7 +67,7 @@ export default function ReportPane() {
             : status?.as_of
               ? `As of ${status.as_of}`
               : "No report yet"}
-          {!running && latest != null && ` · ${latest.model}`}
+          {!running && selected != null && ` · ${selected.model}`}
         </p>
       </div>
 
@@ -87,18 +90,33 @@ export default function ReportPane() {
         <p className="text-sm text-rose-400">
           {(reportsQuery.error as Error)?.message ?? "Failed to load reports."}
         </p>
-      ) : latest == null ? (
+      ) : selected == null ? (
         <p className="text-sm text-slate-400">
           No report yet. Generate one after the close to pull the Unusual Whales digest.
         </p>
       ) : (
         <article className="max-w-2xl">
           <div className="mb-4 flex flex-wrap items-baseline gap-3">
-            <h2 className="text-xs font-medium uppercase tracking-wide text-slate-500">
-              {latest.session_date}
-            </h2>
+            {reports.length > 1 ? (
+              <select
+                value={selected.session_date}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                aria-label="Report date"
+                className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs font-medium uppercase tracking-wide text-slate-300 hover:text-slate-100"
+              >
+                {reports.map((report) => (
+                  <option key={report.session_date} value={report.session_date}>
+                    {report.session_date}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <h2 className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                {selected.session_date}
+              </h2>
+            )}
             <a
-              href={`/api/report/${latest.session_date}/raw`}
+              href={`/api/report/${selected.session_date}/raw`}
               target="_blank"
               rel="noreferrer"
               className="text-xs text-slate-400 hover:text-slate-200"
@@ -106,7 +124,7 @@ export default function ReportPane() {
               Source JSON
             </a>
           </div>
-          <ReportBody analysis={latest.analysis} />
+          <ReportBody analysis={selected.analysis} />
         </article>
       )}
     </div>

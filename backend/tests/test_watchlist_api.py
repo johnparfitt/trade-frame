@@ -31,6 +31,15 @@ def _snapshot(symbol: str) -> SymbolSnapshot:
         float_pct=99.0,
         short_pct_float=0.8,
         days_to_cover=1.2,
+        gamma_magnet=195.0,
+        dilution_risk=35.0,
+        dilution_note="Shares +10% YoY; active S-3 shelf",
+        sec_filing_url="https://www.sec.gov/Archives/edgar/data/320193/x/y-index.htm",
+        sec_filing_form="8-K",
+        sec_filing_date="2026-09-30",
+        sec_significance=82,
+        sec_significance_note="Significance 82/100 (bearish)\n8-K filed 2026-09-30\nPriced offering",
+        sec_significance_direction="bearish",
         error=None,
     )
 
@@ -86,6 +95,15 @@ def test_add_then_list(client: TestClient):
     rows = listed.json()
     assert len(rows) == 1
     assert rows[0]["symbol"] == "AAPL"
+    assert rows[0]["gamma_magnet"] == 195.0
+
+
+def test_gamma_magnet_is_served_on_the_row(client: TestClient):
+    client.post("/api/watchlist", json={"symbol": "AAPL"})
+
+    row = client.get("/api/watchlist").json()[0]
+
+    assert row["gamma_magnet"] == 195.0
 
 
 def test_add_unknown_symbol_not_stored(client: TestClient):

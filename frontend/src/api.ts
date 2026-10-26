@@ -16,6 +16,15 @@ export interface WatchlistRow {
   float_pct: number | null;
   short_pct_float: number | null;
   days_to_cover: number | null;
+  gamma_magnet: number | null;
+  dilution_risk: number | null;
+  dilution_note: string | null;
+  sec_filing_url: string | null;
+  sec_filing_form: string | null;
+  sec_filing_date: string | null;
+  sec_significance: number | null;
+  sec_significance_note: string | null;
+  sec_significance_direction: string | null;
   added_at: string;
   error: string | null;
 }

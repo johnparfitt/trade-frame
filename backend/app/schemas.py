@@ -42,5 +42,14 @@ class WatchlistRow(BaseModel):
     float_pct: float | None = None  # floatShares / sharesOutstanding as %
     short_pct_float: float | None = None  # % of float shorted
     days_to_cover: float | None = None  # short ratio
+    gamma_magnet: float | None = None  # strike with the largest-magnitude net gamma
+    dilution_risk: float | None = None  # 0-100 SEC-derived dilution risk score
+    dilution_note: str | None = None  # human-readable drivers behind the score
+    sec_filing_url: str | None = None  # link to the surfaced (significant) SEC filing
+    sec_filing_form: str | None = None  # that filing's form type (e.g. "8-K")
+    sec_filing_date: str | None = None  # that filing's ISO date
+    sec_significance: int | None = None  # 0-100 LLM significance of that filing
+    sec_significance_note: str | None = None  # why it is significant (hover)
+    sec_significance_direction: str | None = None  # bullish | bearish | neutral
     added_at: datetime
     error: str | None = None  # populated if the symbol could not be resolved
