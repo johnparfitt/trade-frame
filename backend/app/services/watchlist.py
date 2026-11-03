@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 
 from sqlalchemy import select
@@ -58,9 +60,43 @@ def remove_symbol(db: Session, symbol: str) -> bool:
     return True
 
 
+# Snapshots are network-bound (yfinance, UW, EDGAR, LLM), so a cold watchlist
+# loads several symbols at once. Kept small: each symbol makes two UW calls and
+# EDGAR's shared throttle caps it at 8 req/s regardless.
+_MAX_WORKERS = 4
+_executor = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="snapshot")
+# symbol -> in-flight lookup, so overlapping refreshes share one fetch per symbol.
+_inflight: dict[str, Future[SymbolSnapshot]] = {}
+_inflight_lock = threading.Lock()
+
+
+def _forget(symbol: str, future: Future[SymbolSnapshot]) -> None:
+    with _inflight_lock:
+        if _inflight.get(symbol) is future:
+            del _inflight[symbol]
+
+
+def _snapshot_future(symbol: str) -> Future[SymbolSnapshot]:
+    with _inflight_lock:
+        future = _inflight.get(symbol)
+        created = future is None
+        if future is None:
+            future = _executor.submit(market_data.get_snapshot, symbol)
+            _inflight[symbol] = future
+    if created:
+        # Outside the lock: an already-finished future runs the callback inline.
+        future.add_done_callback(lambda f: _forget(symbol, f))
+    return future
+
+
 def enriched_rows(db: Session) -> list[WatchlistRow]:
+    items = list_symbols(db)
+    futures = [_snapshot_future(item.symbol) for item in items]
     rows: list[WatchlistRow] = []
-    for item in list_symbols(db):
-        snap = market_data.get_snapshot(item.symbol)
+    for item, future in zip(items, futures):
+        try:
+            snap = future.result()
+        except Exception as exc:  # get_snapshot never raises; keep one bad row from failing all
+            snap = SymbolSnapshot(symbol=item.symbol, error=f"Lookup failed: {exc}")
         rows.append(build_row(item, snap))
     return rows

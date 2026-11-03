@@ -77,18 +77,49 @@ replace that with a manual per-field mapping.
 - SEC EDGAR: the watchlist Dilution Risk + SEC columns come from the free
   EDGAR APIs (`app/services/edgar.py`, filings + SEC link) — no key, but EDGAR
   requires a descriptive `User-Agent` (config `TF_SEC_USER_AGENT`) and caps
-  callers at 10 req/s. The Dilution Risk *score* is computed in
-  `app/services/dilution.py`, which blends those EDGAR filing signals with
-  Unusual Whales financial statements (`/api/stock/{ticker}/financials`: net
-  equity issuance, share growth, cash runway) — so it also needs
-  `TF_UW_API_KEY`. Fetched on-demand during `get_snapshot` and cached
-  (`TF_SEC_CACHE_TTL`); no scheduler. Lookups never raise — a missing CIK/key
-  or an outage yields empty/partial fields so the row still renders. The score
-  is a transparent, tunable heuristic (constants in `dilution.py`), not a black
-  box; it weights what a company actually does (issuance/buybacks/burn) over
-  the mere capacity to dilute (a boilerplate shelf). `edgar.py` returns a
-  newest-first list of significant-filing *candidates* (10-K/Q, 8-K, S-1/3,
-  424B, S-8, 14A/14C, Form D); it does not itself pick the surfaced filing.
+  callers at 10 req/s (`edgar.py` throttles every EDGAR call to 8 req/s; route
+  new EDGAR calls through `edgar.http_get_json` / `fetch_document_text`).
+  `edgar.py` returns a newest-first list of significant-filing *candidates*
+  (10-K/Q, 8-K, S-1/3, 424B, S-8, 14A/14C, Form D); it does not itself pick
+  the surfaced filing. Its document-text LRU is shared by the SEC scorer and
+  the dilution document checks (checks run first, so the scorer's read hits it).
+- Dilution Risk *score* (`app/services/dilution.py`): 0-100 in four capped
+  groups — Behavior 45 (UW share growth, SBC, cash runway), Overhang 15
+  (warrants, convertibles), Filings 30 (ATM / offering / shelf / S-1 / Form D /
+  8-K Item 3.02, scaled down for larger companies), Distress 15 (reverse
+  splits, proxy proposals) — clamped to 100, whole points, and the hover note
+  always adds up to the score. Inputs:
+  - UW financials (`/api/stock/{ticker}/financials`), so it needs
+    `TF_UW_API_KEY`. UW share counts are unreliable across splits, so a >40%
+    YoY change with a split in the window (or unknown split history) drops
+    the growth points with a "possible split" note.
+  - `app/services/company_facts.py`: EDGAR XBRL company facts (one call per
+    CIK, cached per latest periodic filing) for warrants, convertibles, and
+    the cover-page share count.
+  - `app/services/filing_checks.py`: keyword checks on filing text (424B
+    cover = ATM / equity / debt takedown, proxy = authorized-share increase /
+    reverse split proposed, 8-K Item 5.03 = reverse split), under a fixed
+    per-symbol fetch budget and cached per accession in a `lru.py`
+    `BoundedLRU`. An unfetchable document counts as equity and marks the
+    result degraded.
+  - Both persist results in SQLite via `app/services/sec_store.py`
+    (`sec_cached_results`), each row keyed to a hash of the module's
+    keywords/tags (`rules_version`), so editing those constants re-checks;
+    bump the module's `_LOGIC_REVISION` when changing check/parse logic the
+    constants don't capture. Unknowns and failed lookups are never persisted;
+    stored company facts expire after 30 days.
+  - Price, market cap, and split history passed in from `get_snapshot`
+    (splits come from its 1-year daily history; don't add a `Ticker.splits`
+    call — it downloads full max history).
+  On-demand during `get_snapshot`, cached `TF_SEC_CACHE_TTL` (10 minutes when
+  degraded); no scheduler. Never raises — a missing CIK/key or an outage
+  yields partial fields and an "unavailable" note, and the score is None (not
+  0) when no source has data. A transparent, tunable heuristic (constants in
+  `dilution.py`) that weights what a company actually does
+  (issuance/buybacks/burn) over the mere capacity to dilute (a boilerplate
+  shelf). Before changing weights, run the dev calibration script
+  (`backend/scripts/calibrate_dilution.py`: `sanity`, `backtest`, `tune`; live
+  network, not a product feature) and keep buyback large caps below 15.
 - SEC filing significance (the watchlist `SEC` column) is in
   `app/services/sec_significance.py`: an LLM reads the filing document and
   returns `{score, direction, reason}` — `score` is 0-100 *magnitude* of the
@@ -101,7 +132,10 @@ replace that with a manual per-field mapping.
   The prompt deliberately forces earnings (results, earnings-date announcements,
   guidance) and acquirer-side M&A (unless dilutive/transformational) below the
   threshold. Scores are cached per accession (filings are immutable; ~1 LLM call
-  per new filing) and the scan stops at the first qualifier. Resilient + never
+  per new filing) in memory, and LLM scores also persist in SQLite
+  (`sec_significance_scores`, keyed to a model + prompt hash so editing the
+  prompt re-scores; heuristic fallbacks are never persisted). The scan stops at
+  the first qualifier. Resilient + never
   raises: a missing/empty key, `TF_SEC_SIGNIFICANCE_ENABLED=false`, an outage, or
   an unparseable response falls back to a deterministic form/8-K-item heuristic
   (which carries a direction too). Keys from env (`TF_ANTHROPIC_API_KEY`, model

@@ -12,7 +12,8 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
 import yfinance as yf
 
@@ -175,8 +176,35 @@ def _next_earnings(info: dict) -> str | None:
         return None
 
 
-def _compute_atr_pct_50(ticker: yf.Ticker, last_close: float | None) -> float | None:
-    """Extension from 50 SMA measured in ATR%-of-price units.
+def _year_history(ticker: yf.Ticker) -> Any:
+    """One year of daily bars; one fetch serves the ATR metric and split history.
+
+    A year covers the dilution score's 12-month reverse-split window. Reading
+    ``Ticker.splits`` instead would download the symbol's entire price history.
+    """
+    try:
+        return ticker.history(period="1y", interval="1d")
+    except Exception:
+        return None
+
+
+def _splits_from_history(hist: Any) -> list[tuple[date, float]] | None:
+    """``(date, new/old ratio)`` splits in ``hist``; None when the fetch failed.
+
+    yfinance can return an empty frame instead of raising, so a frame without
+    the "Stock Splits" column counts as failed, not as "no splits".
+    """
+    if hist is None or "Stock Splits" not in hist.columns:
+        return None
+    try:
+        col = hist["Stock Splits"]
+        return [(ts.date(), float(ratio)) for ts, ratio in col[col != 0].items()]
+    except Exception:
+        return None
+
+
+def _compute_atr_pct_50(hist: Any, last_close: float | None) -> float | None:
+    """Extension from 50 SMA measured in ATR%-of-price units, over ~6 months of ``hist``.
 
     - ma50 = 50-day SMA of close
     - atr14 = 14-period Wilder ATR
@@ -185,7 +213,11 @@ def _compute_atr_pct_50(ticker: yf.Ticker, last_close: float | None) -> float | 
     - atr_pct_50 = gain_from_ma50 / atr_pct
     """
     try:
-        hist = ticker.history(period="6mo", interval="1d")
+        if hist is None or hist.empty:
+            return None
+        # Wilder smoothing depends on the starting bar, so keep the 6-month
+        # window this metric has always used.
+        hist = hist[hist.index >= hist.index[-1] - timedelta(days=183)]
         hist = hist.dropna(subset=["High", "Low", "Close"])
         if len(hist) < 64:
             return None
@@ -292,7 +324,8 @@ def get_snapshot(symbol: str) -> SymbolSnapshot:
 
         pct_change = _compute_pct_change(ticker, last, prev)
         rvol = _compute_rvol(ticker)
-        atr_pct_50 = _compute_atr_pct_50(ticker, last)
+        year_history = _year_history(ticker)
+        atr_pct_50 = _compute_atr_pct_50(year_history, last)
         adr_pct = _compute_adr_pct(ticker)
 
         high52 = _as_float(_fi_get(fi, "yearHigh")) or _as_float(info.get("fiftyTwoWeekHigh"))
@@ -320,7 +353,12 @@ def get_snapshot(symbol: str) -> SymbolSnapshot:
             snapshot.days_to_cover = days_to_cover
             levels = gex.get_levels(symbol)
             snapshot.gamma_magnet = levels.gamma_magnet
-            dil = dilution.get_dilution(symbol)
+            dil = dilution.get_dilution(
+                symbol,
+                price=last,
+                market_cap=_as_float(info.get("marketCap")),
+                splits=_splits_from_history(year_history),
+            )
             snapshot.dilution_risk = dil.dilution_risk
             snapshot.dilution_note = dil.dilution_note
             snapshot.sec_filing_url = dil.sec_filing_url

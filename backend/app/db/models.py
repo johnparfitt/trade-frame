@@ -61,6 +61,39 @@ class BreadthDay(Base):
     computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class SecSignificanceScore(Base):
+    """LLM significance score for one SEC filing (filings are immutable).
+
+    ``prompt_key`` identifies the prompt + model that produced the score; a
+    lookup under a different key is a miss, so editing the prompt re-scores.
+    """
+
+    __tablename__ = "sec_significance_scores"
+
+    accession: Mapped[str] = mapped_column(String(30), primary_key=True)
+    prompt_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    scored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SecCachedResult(Base):
+    """A persisted SEC lookup result (a filing check or parsed company facts).
+
+    ``version`` hashes the rules that produced ``payload`` (JSON); a lookup
+    under a different version is a miss, so editing keywords or tags re-checks.
+    """
+
+    __tablename__ = "sec_cached_results"
+
+    kind: Mapped[str] = mapped_column(String(30), primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    version: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    stored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class DailyReport(Base):
     """One trading day's Unusual Whales digest and its LLM analysis."""
 

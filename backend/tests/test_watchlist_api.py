@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -11,7 +13,7 @@ from app.db.session import Base, get_db
 from app.main import app
 from app.services.market_data import SymbolSnapshot
 
-KNOWN = {"AAPL"}
+KNOWN = {"AAPL", "MSFT"}
 
 
 def _snapshot(symbol: str) -> SymbolSnapshot:
@@ -136,6 +138,41 @@ def test_blank_and_invalid_body_are_422(client: TestClient):
     assert client.post("/api/watchlist", json={"symbol": ""}).status_code == 422
     assert client.post("/api/watchlist", json={"symbol": "   "}).status_code == 422
     assert client.post("/api/watchlist", json={}).status_code == 422
+
+
+def test_symbols_load_concurrently_in_order(client: TestClient, monkeypatch):
+    client.post("/api/watchlist", json={"symbol": "MSFT"})
+    client.post("/api/watchlist", json={"symbol": "AAPL"})
+    # Each lookup waits for the other: a serial loop would break the barrier.
+    barrier = threading.Barrier(2, timeout=5)
+
+    def slow_snapshot(symbol: str) -> SymbolSnapshot:
+        barrier.wait()
+        return _snapshot(symbol)
+
+    monkeypatch.setattr("app.services.market_data.get_snapshot", slow_snapshot)
+
+    rows = client.get("/api/watchlist").json()
+
+    assert [r["symbol"] for r in rows] == ["AAPL", "MSFT"]
+    assert all(r["error"] is None for r in rows)
+
+
+def test_one_failing_lookup_does_not_fail_the_list(client: TestClient, monkeypatch):
+    client.post("/api/watchlist", json={"symbol": "AAPL"})
+    client.post("/api/watchlist", json={"symbol": "MSFT"})
+
+    def flaky(symbol: str) -> SymbolSnapshot:
+        if symbol == "MSFT":
+            raise RuntimeError("boom")
+        return _snapshot(symbol)
+
+    monkeypatch.setattr("app.services.market_data.get_snapshot", flaky)
+
+    rows = {r["symbol"]: r for r in client.get("/api/watchlist").json()}
+
+    assert rows["AAPL"]["error"] is None
+    assert rows["MSFT"]["error"] == "Lookup failed: boom"
 
 
 def test_symbol_stored_uppercase(client: TestClient):

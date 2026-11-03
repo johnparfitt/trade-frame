@@ -9,35 +9,40 @@ EDGAR APIs (no key; EDGAR only asks for a descriptive ``User-Agent`` and a
 - ticker -> CIK map: ``/files/company_tickers.json`` (one global map, cached).
 - recent filings: ``/submissions/CIK##########.json`` -> ``filings.recent``.
 
-From those it derives a few dilution-relevant filing signals (active S-3 shelf,
-recent 424B offering, offering frequency, recent S-1, recent Form D) plus a
-capped, newest-first list of *significant* filing candidates. Which of those
-candidates is actually surfaced in the UI is decided downstream by
-``app.services.sec_significance`` (it only surfaces filings scoring above a
-threshold), so this module no longer picks a single "latest significant" link.
+From those it returns dated filing records (form, filing date, accession,
+document URL, 8-K items) for ``app.services.dilution`` to score — this module
+holds no scoring logic — plus a capped, newest-first list of *significant*
+filing candidates. Which of those candidates is actually surfaced in the UI is
+decided downstream by ``app.services.sec_significance`` (it only surfaces
+filings scoring above a threshold).
 
 This module can also fetch a filing's primary document text (for the LLM
-significance scorer). All EDGAR requests pass through a small shared throttle to
-respect the 10 req/s cap.
+significance scorer and ``app.services.filing_checks``), keeping a small LRU
+of recent texts so both readers of one filing share a fetch, and exposes the
+throttled JSON GET that ``app.services.company_facts`` uses. All EDGAR
+requests pass through a small shared throttle to respect the 10 req/s cap.
 
 Results are cached for ``TF_SEC_CACHE_TTL`` seconds (filings update at most
-daily). Lookups never raise: a missing CIK or an EDGAR outage yields an empty
-``FilingInfo`` so the rest of the row still renders.
+daily). Lookups never raise: a missing CIK yields an empty ``FilingInfo``
+(``found=False``) and an EDGAR outage a failed one (``ok=False``, not cached),
+so the rest of the row still renders and callers can tell the two apart.
 """
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import httpx
 
 from app.config import get_settings
+from app.services.lru import BoundedLRU
 
 logger = logging.getLogger(__name__)
 
@@ -65,16 +70,27 @@ _SIGNIFICANT_FORMS = {
 }
 _FORM_D_FORMS = {"D", "D/A"}
 
-# Lookback windows for the filing signals (days).
-_SHELF_DAYS = 3 * 365  # an S-3 shelf is "active" for ~3 years
-_REGISTRATION_DAYS = 180  # a recent S-1
-_SERIAL_WINDOW_DAYS = 2 * 365  # window for counting repeat 424B offerings
+# Filing records older than this are dropped (the longest dilution window is
+# the ~3-year shelf life).
+_RECORD_DAYS = 3 * 365 + 30
 
 # How many newest significant filings the significance scorer may consider.
 _MAX_CANDIDATES = 5
-# Cap on filing-document text handed to the LLM (cover page / 8-K item text /
-# offering summary live near the top; this keeps token cost bounded).
-_DOC_MAX_CHARS = 50_000
+# Default cap on stripped document text (cover page / 8-K item text / offering
+# summary live near the top; this keeps LLM token cost bounded).
+DOC_MAX_CHARS = 50_000
+# Recently fetched document texts (url -> (text, chars kept)). Filings are
+# immutable; this only needs to span one scoring pass (the significance scorer
+# and the keyword checks often open the same filing), so it stays small: proxy
+# texts can be ~1M characters.
+_DOC_CACHE_MAX_ENTRIES = 32
+_doc_cache: BoundedLRU[str, tuple[str, int]] = BoundedLRU(_DOC_CACHE_MAX_ENTRIES)
+
+# Document-fetch failure kinds. Transient failures (network, timeout, 403 SEC
+# throttling or a bad User-Agent, 429, 5xx) may succeed on retry and must not
+# be cached; permanent ones (no URL, 404, 410, other 4xx) will not.
+TRANSIENT = "transient"
+PERMANENT = "permanent"
 
 # Shared client-side throttle: EDGAR caps callers at 10 req/s, so keep a little
 # headroom. Opening filing documents adds requests on top of the 2 JSON calls
@@ -104,18 +120,41 @@ class FilingRef:
 
 
 @dataclass(frozen=True)
-class FilingInfo:
-    """Dilution-relevant filing signals + newest-first significant candidates."""
+class FilingRecord:
+    """One dated filing of any form, for the dilution scorer."""
 
-    shelf_active: bool = False  # an S-3 shelf filed within _SHELF_DAYS
-    days_since_424b: int | None = None  # age of the most recent 424B* offering
-    count_424b_24mo: int = 0  # number of 424B* offerings in the serial window
-    recent_s1: bool = False  # an S-1 filed within _REGISTRATION_DAYS
-    days_since_form_d: int | None = None  # age of the most recent Form D (D/D-A)
+    form: str
+    filed: date
+    accession: str
+    doc_url: str = ""  # full URL to the primary document ("" when none)
+    items: tuple[str, ...] = ()  # 8-K item codes, e.g. ("3.02",)
+
+
+@dataclass(frozen=True)
+class FilingInfo:
+    """Newest-first dated filing records + significant-filing candidates.
+
+    ``ok`` is False when the lookup failed (outage), as opposed to a symbol
+    that simply has no CIK (``found`` False, ``ok`` True).
+    """
+
+    ok: bool = True
+    found: bool = False
+    records: tuple[FilingRecord, ...] = field(default_factory=tuple)
     candidates: tuple[FilingRef, ...] = field(default_factory=tuple)
+    cik: int | None = None
+
+
+@dataclass(frozen=True)
+class DocText:
+    """A fetched document's stripped text, or why it could not be fetched."""
+
+    text: str = ""
+    failure: str | None = None  # None, TRANSIENT, or PERMANENT
 
 
 EMPTY_FILINGS = FilingInfo()
+FAILED_FILINGS = FilingInfo(ok=False)
 
 # symbol -> (expires_at, info)
 _cache: dict[str, tuple[float, FilingInfo]] = {}
@@ -145,10 +184,11 @@ def _cache_put(symbol: str, info: FilingInfo) -> None:
 
 
 def clear_cache() -> None:
-    """Test helper: drop the per-symbol cache and the shared CIK map."""
+    """Test helper: drop the per-symbol cache, document texts, and the CIK map."""
     global _cik_map, _cik_expires_at
     with _cache_lock:
         _cache.clear()
+    _doc_cache.clear()
     with _cik_lock:
         _cik_map = None
         _cik_expires_at = 0.0
@@ -165,7 +205,8 @@ def _throttle() -> None:
         _last_call = time.monotonic()
 
 
-def _http_get_json(url: str, *, session: _SessionProtocol) -> dict[str, Any]:
+def http_get_json(url: str, *, session: _SessionProtocol) -> dict[str, Any]:
+    """Throttled EDGAR JSON GET. Raises on HTTP or network errors (see ``failure_kind``)."""
     headers = {
         "User-Agent": get_settings().sec_user_agent,
         "Accept": "application/json",
@@ -182,32 +223,66 @@ def _document_url(cik: int, accession: str, primary_doc: str) -> str:
     return f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{acc_nodash}/{primary_doc}"
 
 
+# Blocks whose *content* is not filing prose: CSS, JS, and the Inline XBRL
+# header (hidden facts that can push an iXBRL cover page far down the text).
+_HIDDEN_BLOCK_RE = re.compile(
+    r"<(style|script|ix:header)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 
 
-def fetch_document_text(url: str, *, session: _SessionProtocol) -> str:
-    """Fetch a filing's primary document as plain text (truncated). Never raises.
+def strip_html(raw: str) -> str:
+    """Crude HTML -> plain text: drop hidden blocks and tags, decode entities."""
+    text = _TAG_RE.sub(" ", _HIDDEN_BLOCK_RE.sub(" ", raw))
+    return _WS_RE.sub(" ", html.unescape(text)).strip()
 
-    The body is handed to the LLM significance scorer, so crude HTML stripping
-    is enough. Returns "" on any failure or when there is no document URL.
+
+def failure_kind(exc: Exception) -> str:
+    """``TRANSIENT`` (network, timeout, 403, 429, 5xx) or ``PERMANENT`` (other 4xx)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (403, 429) or status >= 500:
+            return TRANSIENT
+        return PERMANENT
+    return TRANSIENT
+
+
+def fetch_document_text(
+    url: str, *, session: _SessionProtocol, max_chars: int = DOC_MAX_CHARS
+) -> DocText:
+    """Fetch a filing's primary document as stripped, truncated text. Never raises.
+
+    On failure the text is empty and ``failure`` says whether a retry could
+    help (``TRANSIENT``) or not (``PERMANENT``, including a missing URL).
     """
     if not url:
-        return ""
+        return DocText(failure=PERMANENT)
+    cached = _doc_cache.get(url)
+    if cached is not None and max_chars <= cached[1]:
+        return DocText(text=cached[0][:max_chars])
     headers = {"User-Agent": get_settings().sec_user_agent}
     try:
         _throttle()
         response = session.get(url, headers=headers)
         response.raise_for_status()
         raw = response.text
-    except Exception as exc:  # pragma: no cover - defensive; live-only path
-        logger.warning("SEC EDGAR document fetch failed (%s): %s", url, exc)
-        return ""
-    text = _WS_RE.sub(" ", _TAG_RE.sub(" ", raw)).strip()
-    return text[:_DOC_MAX_CHARS]
+    except Exception as exc:
+        kind = failure_kind(exc)
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403:
+            logger.warning(
+                "SEC EDGAR returned 403 for %s; check TF_SEC_USER_AGENT or throttling", url
+            )
+        else:
+            logger.warning("SEC EDGAR document fetch failed (%s, %s): %s", url, kind, exc)
+        return DocText(failure=kind)
+    kept = max(max_chars, DOC_MAX_CHARS)
+    text = strip_html(raw)[:kept]
+    _doc_cache.put(url, (text, kept))
+    return DocText(text=text[:max_chars])
 
 
-def _cik10(cik: int) -> str:
+def cik10(cik: int) -> str:
     return str(cik).zfill(10)
 
 
@@ -216,7 +291,7 @@ def _get_cik(symbol: str, session: _SessionProtocol) -> int | None:
     global _cik_map, _cik_expires_at
     with _cik_lock:
         if _cik_map is None or time.monotonic() >= _cik_expires_at:
-            data = _http_get_json(COMPANY_TICKERS_URL, session=session)
+            data = http_get_json(COMPANY_TICKERS_URL, session=session)
             mapping: dict[str, int] = {}
             for row in data.values():
                 if not isinstance(row, dict):
@@ -303,50 +378,44 @@ def _build_candidates(filings: list[dict[str, Any]], cik: int) -> tuple[FilingRe
     return tuple(refs)
 
 
-def _most_recent(
-    filings: list[dict[str, Any]], pred: Callable[[str], bool]
-) -> dict[str, Any] | None:
-    """First filing (newest-first) whose form matches ``pred``."""
+def _build_records(
+    filings: list[dict[str, Any]], cik: int, today: date
+) -> tuple[FilingRecord, ...]:
+    records: list[FilingRecord] = []
     for f in filings:
-        if pred(f["form"]):
-            return f
-    return None
+        if (today - f["date"]).days > _RECORD_DAYS:
+            break  # newest-first: everything after is older still
+        primary_doc = f.get("primary_doc", "")
+        records.append(
+            FilingRecord(
+                form=f["form"],
+                filed=f["date"],
+                accession=f["accession"],
+                doc_url=_document_url(cik, f["accession"], primary_doc) if primary_doc else "",
+                items=f.get("items", ()),
+            )
+        )
+    return tuple(records)
 
 
 def _build_filings(cik: int, session: _SessionProtocol, today: date) -> FilingInfo:
-    submissions = _http_get_json(SUBMISSIONS_URL.format(cik10=_cik10(cik)), session=session)
+    submissions = http_get_json(SUBMISSIONS_URL.format(cik10=cik10(cik)), session=session)
     filings = _parse_recent_filings(submissions)
-
-    shelf = _most_recent(filings, lambda f: f.startswith("S-3"))
-    shelf_active = shelf is not None and (today - shelf["date"]).days <= _SHELF_DAYS
-
-    recent_424b = _most_recent(filings, lambda f: f.startswith("424B"))
-    days_since_424b = (today - recent_424b["date"]).days if recent_424b is not None else None
-
-    count_424b = sum(
-        1
-        for f in filings
-        if f["form"].startswith("424B") and 0 <= (today - f["date"]).days <= _SERIAL_WINDOW_DAYS
-    )
-
-    s1 = _most_recent(filings, lambda f: f == "S-1")
-    recent_s1 = s1 is not None and 0 <= (today - s1["date"]).days <= _REGISTRATION_DAYS
-
-    form_d = _most_recent(filings, lambda f: f in _FORM_D_FORMS)
-    days_since_form_d = (today - form_d["date"]).days if form_d is not None else None
-
     return FilingInfo(
-        shelf_active=shelf_active,
-        days_since_424b=days_since_424b,
-        count_424b_24mo=count_424b,
-        recent_s1=recent_s1,
-        days_since_form_d=days_since_form_d,
+        ok=True,
+        found=True,
+        records=_build_records(filings, cik, today),
         candidates=_build_candidates(filings, cik),
+        cik=cik,
     )
 
 
 def get_filings(symbol: str, *, session: _SessionProtocol | None = None) -> FilingInfo:
-    """Return SEC filing signals + link for ``symbol``; empty when unavailable."""
+    """Return dated filing records + candidates for ``symbol``.
+
+    Empty (``found=False``) when the symbol has no CIK; failed (``ok=False``,
+    not cached) on an EDGAR outage.
+    """
     symbol = symbol.strip().upper()
     cached = _cache_get(symbol)
     if cached is not None:
@@ -364,7 +433,7 @@ def get_filings(symbol: str, *, session: _SessionProtocol | None = None) -> Fili
         # An EDGAR outage must not blank out the rest of the watchlist row, and
         # must not be cached so the next refresh can retry.
         logger.warning("SEC EDGAR lookup failed for %s: %s", symbol, exc)
-        return EMPTY_FILINGS
+        return FAILED_FILINGS
     finally:
         if owned is not None:
             owned.close()

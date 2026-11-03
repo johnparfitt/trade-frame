@@ -18,7 +18,7 @@ Return two things:
       non-reliance, major litigation or adverse rulings.
     - "bullish": buybacks, debt paydown / deleveraging, favorable litigation
       resolutions, transformational accretive deals, clearly positive
-      structural news.
+      structural news. dramatic improvement in financial condition.
     - "neutral": direction genuinely unclear or mixed.
 
 HARD EXCLUSIONS (these MUST score below 50, no matter how big):

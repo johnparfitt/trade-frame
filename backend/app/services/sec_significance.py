@@ -9,7 +9,8 @@ entirely, so a real filing is never hidden behind a junk one filed moments
 later; if nothing clears the bar, the column is blank.
 
 Scoring is cached per accession (filings are immutable, so each is analyzed at
-most once) and the scan stops at the first qualifier, so steady state is about
+most once): in memory, and LLM scores also in SQLite so a restart doesn't pay
+for them again. The scan stops at the first qualifier, so steady state is about
 one LLM call per genuinely new filing. Everything is resilient: a missing key,
 disabled scoring, an outage, or an unparseable response falls back to a
 deterministic form/item heuristic, and nothing here ever raises.
@@ -17,19 +18,23 @@ deterministic form/item heuristic, and nothing here ever raises.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
-import threading
 from dataclasses import dataclass
-from datetime import date
-from typing import Any, Sequence
+from datetime import date, datetime, timezone
+from typing import Any, Callable, Sequence
 
 import httpx
+from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, get_settings
+from app.db.models import SecSignificanceScore
+from app.db.session import SessionLocal
 from app.services import edgar, llm
 from app.services.edgar import FilingRef
+from app.services.lru import BoundedLRU
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +94,65 @@ class SigResult:
 EMPTY = SigResult()
 
 # accession -> (score, direction, reason) for already-scored filings. Immutable
-# filings, so this never expires within a process.
-_cache: dict[str, tuple[int, str, str]] = {}
-_cache_lock = threading.Lock()
+# filings, so entries never expire; the bound only evicts the least recent.
+_CACHE_MAX_ENTRIES = 4096
+_cache: BoundedLRU[str, tuple[int, str, str]] = BoundedLRU(_CACHE_MAX_ENTRIES)
+
+
+_session_factory: Callable[[], Session] = SessionLocal
 
 
 def clear_cache() -> None:
-    """Test helper: drop the per-accession score cache."""
-    with _cache_lock:
-        _cache.clear()
+    """Test helper: drop the in-memory per-accession score cache."""
+    _cache.clear()
+
+
+def set_session_factory(factory: Callable[[], Session]) -> None:
+    """Point the persisted score store at another database (tests)."""
+    global _session_factory
+    _session_factory = factory
+
+
+def _prompt_key() -> str | None:
+    """Hash of the model + prompt behind stored scores; None skips the store."""
+    try:
+        raw = f"{get_settings().llm_model}\n{_load_prompt()}"
+    except Exception as exc:
+        logger.warning("SEC significance: prompt unavailable for the score store: %s", exc)
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_stored(accession: str, key: str) -> tuple[int, str, str] | None:
+    """A persisted LLM score for ``accession`` under ``key``, else None. Never raises."""
+    try:
+        with _session_factory() as db:
+            row = db.get(SecSignificanceScore, accession)
+            if row is None or row.prompt_key != key:
+                return None
+            return (row.score, row.direction, row.reason)
+    except Exception as exc:
+        logger.warning("SEC significance: stored score lookup failed for %s: %s", accession, exc)
+        return None
+
+
+def _save_stored(accession: str, key: str, result: tuple[int, str, str]) -> None:
+    score, direction, reason = result
+    try:
+        with _session_factory() as db:
+            db.merge(
+                SecSignificanceScore(
+                    accession=accession,
+                    prompt_key=key,
+                    score=score,
+                    direction=direction,
+                    reason=reason,
+                    scored_at=datetime.now(timezone.utc),
+                )
+            )
+            db.commit()
+    except Exception as exc:
+        logger.warning("SEC significance: storing score failed for %s: %s", accession, exc)
 
 
 def _load_prompt() -> str:
@@ -162,29 +217,43 @@ def _score_one(
     llm_client: Any = None,
 ) -> tuple[int, str, str]:
     """Score one filing (cached by accession). Never raises."""
-    with _cache_lock:
-        hit = _cache.get(cand.accession)
+    hit = _cache.get(cand.accession)
     if hit is not None:
         return hit
 
-    result = _score_one_uncached(cand, session=session, llm_client=llm_client)
+    key = _prompt_key()
+    stored = _load_stored(cand.accession, key) if key is not None else None
+    if stored is not None:
+        _cache.put(cand.accession, stored)
+        return stored
 
-    with _cache_lock:
-        _cache[cand.accession] = result
+    result, cacheable, from_llm = _score_one_uncached(cand, session=session, llm_client=llm_client)
+
+    if cacheable:
+        _cache.put(cand.accession, result)
+    if from_llm and key is not None:
+        # Only real LLM scores persist: a heuristic fallback (no key, outage)
+        # should be re-scored once the LLM is available again.
+        _save_stored(cand.accession, key, result)
     return result
 
 
 def _score_one_uncached(
     cand: FilingRef, *, session: Any, llm_client: Any
-) -> tuple[int, str, str]:
+) -> tuple[tuple[int, str, str], bool, bool]:
+    """Return ``(result, cacheable, from_llm)``.
+
+    A transient document failure is not cacheable; only a parsed LLM response
+    is ``from_llm``.
+    """
     settings = get_settings()
     if not settings.sec_significance_enabled:
-        return _heuristic(cand.form, cand.items)
+        return _heuristic(cand.form, cand.items), True, False
     try:
-        text = edgar.fetch_document_text(cand.doc_url, session=session)
-        if not text:
-            return _heuristic(cand.form, cand.items)
-        prompt = _build_prompt(cand, text)
+        doc = edgar.fetch_document_text(cand.doc_url, session=session)
+        if not doc.text:
+            return _heuristic(cand.form, cand.items), doc.failure != edgar.TRANSIENT, False
+        prompt = _build_prompt(cand, doc.text)
         raw = llm.run(prompt, client=llm_client)
         parsed = _parse_llm_json(raw)
         if parsed is None:
@@ -193,11 +262,11 @@ def _score_one_uncached(
                 cand.accession,
                 cand.form,
             )
-            return _heuristic(cand.form, cand.items)
-        return parsed
+            return _heuristic(cand.form, cand.items), True, False
+        return parsed, True, True
     except Exception as exc:  # LLM/key/outage -> deterministic fallback
         logger.warning("SEC significance scoring failed for %s: %s", cand.accession, exc)
-        return _heuristic(cand.form, cand.items)
+        return _heuristic(cand.form, cand.items), True, False
 
 
 def _build_prompt(cand: FilingRef, text: str) -> str:
@@ -252,8 +321,7 @@ def evaluate(
             if age > recent_days:
                 break
 
-            with _cache_lock:
-                is_cached = cand.accession in _cache
+            is_cached = cand.accession in _cache
             # Open an EDGAR client lazily, only when a real (uncached, enabled)
             # document fetch is about to happen.
             if (

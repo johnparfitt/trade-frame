@@ -168,7 +168,7 @@ function HoverScore({
         lines.length > 0 &&
         createPortal(
           <div
-            className="pointer-events-none fixed z-50 max-w-xs -translate-x-full rounded-md border border-slate-700 bg-slate-900/95 px-3 py-2 text-left text-xs leading-relaxed shadow-xl"
+            className="pointer-events-none fixed z-50 w-max max-w-xl -translate-x-full rounded-md border border-slate-700 bg-slate-900/95 px-3 py-2 text-left text-xs leading-relaxed shadow-xl"
             style={{ left: pos.x, top: pos.y }}
           >
             {lines.map((line, i) => {

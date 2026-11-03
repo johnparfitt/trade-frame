@@ -17,6 +17,10 @@ from app.config import BACKEND_DIR, get_settings
 # prompts/ lives at the repo root, one level above backend/.
 PROMPT_PATH = BACKEND_DIR.parent / "prompts" / "unusual-whales" / "daily-report.md"
 MAX_TOKENS = 2000
+# The SDK default is a 600s read timeout with 2 retries, so one stalled response
+# could hold a watchlist refresh for ~30 minutes.
+REQUEST_TIMEOUT_SECONDS = 120.0
+MAX_RETRIES = 1
 
 
 class LLMError(RuntimeError):
@@ -42,7 +46,9 @@ class AnthropicClient:
         # Import lazily so the package is only required when actually calling out.
         import anthropic
 
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = anthropic.Anthropic(
+            api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS, max_retries=MAX_RETRIES
+        )
 
     def analyze(self, prompt: str, model: str) -> str:
         message = self._client.messages.create(

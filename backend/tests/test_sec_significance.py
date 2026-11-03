@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import httpx
 import pytest
 
 from app.services import sec_significance
@@ -57,6 +58,7 @@ class _FakeSettings:
         self.sec_significance_enabled = enabled
         self.sec_significance_min = minimum
         self.sec_significance_recent_days = recent_days
+        self.llm_model = "test-model"
 
 
 def _ref(form, d, accession, *, doc, items=()):
@@ -149,6 +151,99 @@ def test_evaluate_caches_by_accession():
 
     assert len(llm.calls) == 1  # second lookup served from the accession cache
     assert len(session.gets) == 1
+
+
+class _ErrorSession:
+    """Every document GET fails with ``status``; records calls."""
+
+    def __init__(self, status: int):
+        self._status = status
+        self.gets: list[str] = []
+
+    def get(self, url: str, *, headers=None):  # noqa: ARG002
+        self.gets.append(url)
+        request = httpx.Request("GET", url)
+        return httpx.Response(self._status, request=request)
+
+
+def test_transient_document_failure_falls_back_and_is_retried():
+    cand = _ref("424B5", _recent(1), "acc1", doc="http://doc1")
+    session = _ErrorSession(503)
+    llm = _FakeLLM(lambda p: '{"score": 99, "reason": "x"}')
+
+    first = sec_significance.evaluate("T", [cand], session=session, llm_client=llm)
+    sec_significance.evaluate("T", [cand], session=session, llm_client=llm)
+
+    assert first.score == 70  # 424B heuristic
+    assert llm.calls == []
+    assert len(session.gets) == 2  # not cached, so the next refresh retries
+
+
+def test_permanent_document_failure_is_cached():
+    cand = _ref("424B5", _recent(1), "acc1", doc="http://doc1")
+    session = _ErrorSession(404)
+
+    sec_significance.evaluate("T", [cand], session=session, llm_client=None)
+    sec_significance.evaluate("T", [cand], session=session, llm_client=None)
+
+    assert len(session.gets) == 1
+
+
+def test_llm_score_survives_a_restart():
+    cand = _ref("424B5", _recent(1), "acc1", doc="http://doc1")
+    session = _DocSession({"http://doc1": "offering"})
+    first_llm = _FakeLLM(lambda p: '{"score": 70, "direction": "bearish", "reason": "offering"}')
+    sec_significance.evaluate("T", [cand], session=session, llm_client=first_llm)
+
+    sec_significance.clear_cache()  # a restart drops the in-memory cache
+    second_llm = _FakeLLM(lambda p: '{"score": 10, "reason": "x"}')
+    res = sec_significance.evaluate("T", [cand], session=session, llm_client=second_llm)
+
+    assert res.score == 70
+    assert second_llm.calls == []
+    assert len(session.gets) == 1
+
+
+def test_stored_score_is_ignored_after_prompt_change(monkeypatch):
+    cand = _ref("424B5", _recent(1), "acc1", doc="http://doc1")
+    session = _DocSession({"http://doc1": "offering"})
+    sec_significance.evaluate(
+        "T", [cand], session=session, llm_client=_FakeLLM(lambda p: '{"score": 70, "reason": "a"}')
+    )
+
+    sec_significance.clear_cache()
+    monkeypatch.setattr(sec_significance, "_prompt_key", lambda: "new-prompt")
+    res = sec_significance.evaluate(
+        "T", [cand], session=session, llm_client=_FakeLLM(lambda p: '{"score": 90, "reason": "b"}')
+    )
+
+    assert res.score == 90
+
+
+def test_heuristic_fallback_is_not_stored():
+    cand = _ref("424B5", _recent(1), "acc1", doc="http://doc1")
+    session = _DocSession({"http://doc1": "offering"})
+    # llm_client=None + no configured key -> heuristic.
+    sec_significance.evaluate("T", [cand], session=session, llm_client=None)
+
+    sec_significance.clear_cache()
+    llm = _FakeLLM(lambda p: '{"score": 90, "direction": "bearish", "reason": "offering"}')
+    res = sec_significance.evaluate("T", [cand], session=session, llm_client=llm)
+
+    assert res.score == 90
+    assert len(llm.calls) == 1
+
+
+def test_store_outage_still_scores():
+    def broken():
+        raise RuntimeError("db locked")
+
+    sec_significance.set_session_factory(broken)
+    cand = _ref("424B5", _recent(1), "acc1", doc="http://doc1")
+    session = _DocSession({"http://doc1": "offering"})
+    llm = _FakeLLM(lambda p: '{"score": 80, "direction": "bearish", "reason": "offering"}')
+
+    assert sec_significance.evaluate("T", [cand], session=session, llm_client=llm).score == 80
 
 
 def test_evaluate_empty_candidates_is_blank():
