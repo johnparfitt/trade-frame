@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from app.schemas import WatchlistRow
 from app.services.market_data import SymbolSnapshot
+from app.services.sec_significance import SecFiling
 from app.services.watchlist import build_row
 
 
@@ -54,6 +55,18 @@ def _fully_populated_snapshot() -> SymbolSnapshot:
     """A SymbolSnapshot with every field set to a distinct, type-correct value."""
     values: dict[str, object] = {}
     for f in dataclasses.fields(SymbolSnapshot):
+        if f.name == "sec_filings":
+            values[f.name] = (
+                SecFiling(
+                    score=82,
+                    direction="bearish",
+                    reason="Priced offering",
+                    form="8-K",
+                    date="2026-09-30",
+                    url="https://www.sec.gov/x",
+                ),
+            )
+            continue
         if f.type in ("str", "str | None"):
             values[f.name] = f"{f.name}-value"
         elif f.type in ("int", "int | None"):
@@ -84,7 +97,10 @@ def test_build_row_carries_every_snapshot_value_through_unchanged():
     row = build_row(item, snap)  # type: ignore[arg-type]
 
     for f in dataclasses.fields(snap):
-        assert getattr(row, f.name) == getattr(snap, f.name), (
-            f"build_row() did not carry '{f.name}' through unchanged"
-        )
+        got = getattr(row, f.name)
+        want = getattr(snap, f.name)
+        if f.name == "sec_filings":
+            assert [item.model_dump() for item in got] == [dataclasses.asdict(item) for item in want]
+            continue
+        assert got == want, f"build_row() did not carry '{f.name}' through unchanged"
     assert row.added_at == added_at

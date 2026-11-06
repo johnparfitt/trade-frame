@@ -1,19 +1,24 @@
-"""LLM-scored significance of a stock's most recent *meaningful* SEC filing.
+"""LLM-scored significance of a stock's recent *meaningful* SEC filings.
 
 The watchlist SEC column is deliberately low-noise: it stays blank unless a
 genuinely significant filing exists. Given the newest-first significant filing
 candidates from ``app.services.edgar``, this module scores each (an LLM reads
-the filing text and rates it 0-100) and surfaces the newest one that scores
-above ``TF_SEC_SIGNIFICANCE_MIN`` (default 50). Worthless filings are skipped
-entirely, so a real filing is never hidden behind a junk one filed moments
-later; if nothing clears the bar, the column is blank.
+the filing text and rates it 0-100) and surfaces every one filed within
+``TF_SEC_SIGNIFICANCE_RECENT_DAYS`` that scores above
+``TF_SEC_SIGNIFICANCE_MIN`` (default 50). Worthless filings are skipped, so a
+real filing is never hidden behind a junk one filed moments later; if nothing
+clears the bar, the column is blank. The cell still leads with the newest
+qualifier.
 
-Scoring is cached per accession (filings are immutable, so each is analyzed at
-most once): in memory, and LLM scores also in SQLite so a restart doesn't pay
-for them again. The scan stops at the first qualifier, so steady state is about
-one LLM call per genuinely new filing. Everything is resilient: a missing key,
-disabled scoring, an outage, or an unparseable response falls back to a
-deterministic form/item heuristic, and nothing here ever raises.
+Scoring is cached per accession: in memory, and LLM scores also in SQLite so a
+restart doesn't pay for them again. Steady state is about one LLM call per
+genuinely new filing in the window. A confirmed second read
+(``apply_review``) replaces that stored score. A combined read of two or more
+qualifiers is separate (``cluster_brief``) and runs only when asked, as does
+the second read itself (``review_filing``). Everything in ``evaluate`` is
+resilient: a missing key, disabled scoring, an outage, or an unparseable
+response falls back to a deterministic form/item heuristic, and ``evaluate``
+never raises.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.config import BACKEND_DIR, get_settings
-from app.db.models import SecSignificanceScore
+from app.db.models import SecFilingBrief, SecSignificanceScore
 from app.db.session import SessionLocal
 from app.services import edgar, llm
 from app.services.edgar import FilingRef
@@ -39,6 +44,10 @@ from app.services.lru import BoundedLRU
 logger = logging.getLogger(__name__)
 
 PROMPT_PATH = BACKEND_DIR.parent / "prompts" / "sec" / "significance.md"
+CLUSTER_PROMPT_PATH = BACKEND_DIR.parent / "prompts" / "sec" / "cluster.md"
+REVIEW_PROMPT_PATH = BACKEND_DIR.parent / "prompts" / "sec" / "review.md"
+# Combined read only. The per-filing scorer keeps the larger document cap.
+CLUSTER_DOC_CHARS = 8_000
 
 # Heuristic fallback scores by form (used when the LLM is unavailable). Each
 # entry is (score, direction, reason); still subject to the >min gate, so
@@ -80,8 +89,20 @@ _OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 @dataclass(frozen=True)
+class SecFiling:
+    """One filing that cleared the significance bar."""
+
+    score: int
+    direction: str
+    reason: str
+    form: str
+    date: str
+    url: str
+
+
+@dataclass(frozen=True)
 class SigResult:
-    """The surfaced filing: its significance score, note, and link metadata."""
+    """The newest surfaced filing, plus every qualifier in the window."""
 
     score: int | None = None
     note: str | None = None
@@ -89,12 +110,54 @@ class SigResult:
     url: str | None = None
     form: str | None = None
     date: str | None = None
+    filings: tuple[SecFiling, ...] = ()
+
+
+class InsufficientFilings(Exception):
+    """Fewer than two filings cleared the bar in the current window."""
+
+
+class BriefUnavailable(Exception):
+    """The combined read failed. Nothing was persisted."""
+
+
+class FilingNotFound(Exception):
+    """No in-window filing for this symbol has the given URL."""
+
+
+class ReviewUnavailable(Exception):
+    """The second read failed, or the replacement score could not be stored."""
+
+
+@dataclass(frozen=True)
+class Brief:
+    text: str
+    generated_at: datetime
+
+
+@dataclass(frozen=True)
+class Review:
+    """A second read of one filing. Not stored until the user confirms it."""
+
+    agrees: bool
+    score: int
+    direction: str
+    reason: str
+    will_show: bool
+
+
+@dataclass(frozen=True)
+class _Hit:
+    ref: FilingRef
+    score: int
+    direction: str
+    reason: str
 
 
 EMPTY = SigResult()
 
-# accession -> (score, direction, reason) for already-scored filings. Immutable
-# filings, so entries never expire; the bound only evicts the least recent.
+# accession -> (score, direction, reason) for already-scored filings. A confirmed
+# review replaces the entry. The bound only evicts the least recent.
 _CACHE_MAX_ENTRIES = 4096
 _cache: BoundedLRU[str, tuple[int, str, str]] = BoundedLRU(_CACHE_MAX_ENTRIES)
 
@@ -136,7 +199,8 @@ def _load_stored(accession: str, key: str) -> tuple[int, str, str] | None:
         return None
 
 
-def _save_stored(accession: str, key: str, result: tuple[int, str, str]) -> None:
+def _save_stored(accession: str, key: str, result: tuple[int, str, str]) -> bool:
+    """Persist a score. Returns False when the write failed."""
     score, direction, reason = result
     try:
         with _session_factory() as db:
@@ -151,8 +215,10 @@ def _save_stored(accession: str, key: str, result: tuple[int, str, str]) -> None
                 )
             )
             db.commit()
+        return True
     except Exception as exc:
         logger.warning("SEC significance: storing score failed for %s: %s", accession, exc)
+        return False
 
 
 def _load_prompt() -> str:
@@ -290,17 +356,16 @@ def _build_note(score: int, direction: str, cand: FilingRef, reason: str) -> str
     )
 
 
-def evaluate(
-    symbol: str,
+def _collect(
     candidates: Sequence[FilingRef],
     *,
     session: Any = None,
     llm_client: Any = None,
-) -> SigResult:
-    """Surface the newest filing scoring above the threshold, else blank.
+) -> tuple[_Hit, ...]:
+    """Score every in-window candidate and keep those above the minimum.
 
-    Scans ``candidates`` newest-first and returns the first whose significance
-    clears ``sec_significance_min``; worthless filings above it are skipped.
+    Candidates are newest-first. The first one older than the window ends the
+    scan, so a stale filing is never sent to the LLM. Never raises.
     """
     settings = get_settings()
     threshold = settings.sec_significance_min
@@ -309,11 +374,9 @@ def evaluate(
 
     owned: httpx.Client | None = None
     active = session
+    hits: list[_Hit] = []
     try:
         for cand in candidates:
-            # Recency gate: candidates are newest-first, so the first one older
-            # than the window means every later one is too -> stop (blank). This
-            # also avoids spending an LLM call on a stale filing.
             try:
                 age = (today - date.fromisoformat(cand.date)).days
             except (TypeError, ValueError):
@@ -337,15 +400,330 @@ def evaluate(
                 cand, session=active, llm_client=llm_client
             )
             if score > threshold:
-                return SigResult(
-                    score=score,
-                    note=_build_note(score, direction, cand, reason),
-                    direction=direction,
-                    url=cand.url,
-                    form=cand.form,
-                    date=cand.date,
-                )
-        return EMPTY
+                hits.append(_Hit(ref=cand, score=score, direction=direction, reason=reason))
+        return tuple(hits)
     finally:
         if owned is not None:
             owned.close()
+
+
+def _to_filing(hit: _Hit) -> SecFiling:
+    return SecFiling(
+        score=hit.score,
+        direction=hit.direction,
+        reason=hit.reason,
+        form=hit.ref.form,
+        date=hit.ref.date,
+        url=hit.ref.url,
+    )
+
+
+def lookup(symbol: str) -> SigResult:
+    """SEC column for ``symbol``. Blank on a quiet window or an EDGAR outage.
+
+    Never raises. Successful filing lists are cached inside ``edgar`` for
+    ``TF_SEC_CACHE_TTL``. A failed lookup is not cached, so the next snapshot
+    retries.
+    """
+    filings = edgar.get_filings(symbol)
+    return evaluate(symbol, filings.candidates)
+
+
+def evaluate(
+    symbol: str,
+    candidates: Sequence[FilingRef],
+    *,
+    session: Any = None,
+    llm_client: Any = None,
+) -> SigResult:
+    """Surface every in-window filing scoring above the threshold, else blank.
+
+    The top-level fields are the newest qualifier. ``filings`` is newest-first
+    and omits scores at or below ``sec_significance_min``.
+    """
+    hits = _collect(candidates, session=session, llm_client=llm_client)
+    if not hits:
+        return EMPTY
+    newest = hits[0]
+    return SigResult(
+        score=newest.score,
+        note=_build_note(newest.score, newest.direction, newest.ref, newest.reason),
+        direction=newest.direction,
+        url=newest.ref.url,
+        form=newest.ref.form,
+        date=newest.ref.date,
+        filings=tuple(_to_filing(hit) for hit in hits),
+    )
+
+
+def _load_cluster_prompt() -> str:
+    return CLUSTER_PROMPT_PATH.read_text(encoding="utf-8").strip()
+
+
+def _brief_key(accessions: Sequence[str]) -> str | None:
+    """Hash of sorted accessions + model + cluster prompt. None skips the store."""
+    try:
+        raw = f"{get_settings().llm_model}\n{_load_cluster_prompt()}\n" + "\n".join(sorted(accessions))
+    except Exception as exc:
+        logger.warning("SEC cluster brief: prompt unavailable for the store: %s", exc)
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _load_brief(key: str) -> Brief | None:
+    """A persisted combined read for ``key``, else None. Never raises."""
+    try:
+        with _session_factory() as db:
+            row = db.get(SecFilingBrief, key)
+            if row is None:
+                return None
+            return Brief(text=row.text, generated_at=row.generated_at)
+    except Exception as exc:
+        logger.warning("SEC cluster brief: stored lookup failed: %s", exc)
+        return None
+
+
+def _save_brief(key: str, text: str, generated_at: datetime) -> None:
+    try:
+        with _session_factory() as db:
+            db.merge(SecFilingBrief(filings_key=key, text=text, generated_at=generated_at))
+            db.commit()
+    except Exception as exc:
+        logger.warning("SEC cluster brief: storing failed: %s", exc)
+
+
+def _build_cluster_prompt(hits: Sequence[_Hit], *, session: Any) -> str:
+    blocks = [_load_cluster_prompt(), ""]
+    for index, hit in enumerate(hits, start=1):
+        doc = edgar.fetch_document_text(
+            hit.ref.doc_url, session=session, max_chars=CLUSTER_DOC_CHARS
+        )
+        text = (doc.text or "")[:CLUSTER_DOC_CHARS] or "(filing text unavailable)"
+        blocks.append(
+            "\n".join(
+                [
+                    f"Filing {index}",
+                    f"Form: {hit.ref.form}",
+                    f"Filing date: {hit.ref.date}",
+                    f"Individual score: {hit.score}/100 ({hit.direction})",
+                    f"Individual reason: {hit.reason}",
+                    "",
+                    "Filing text (truncated):",
+                    text,
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def cluster_brief(
+    symbol: str,
+    *,
+    session: Any = None,
+    llm_client: Any = None,
+) -> Brief:
+    """Combined read of the current in-window qualifiers. Not used by snapshots.
+
+    Raises ``InsufficientFilings`` when fewer than two filings clear the bar.
+    Raises ``BriefUnavailable`` when the LLM call fails; that path does not
+    write a row. A stored brief for the same accessions and prompt is returned
+    without another model call.
+    """
+    info = edgar.get_filings(symbol)
+    hits = _collect(info.candidates, session=session, llm_client=llm_client)
+    if len(hits) < 2:
+        raise InsufficientFilings(symbol)
+
+    key = _brief_key(hit.ref.accession for hit in hits)
+    if key is not None:
+        stored = _load_brief(key)
+        if stored is not None:
+            return stored
+
+    owned: httpx.Client | None = None
+    active = session
+    if active is None:
+        owned = httpx.Client(timeout=30.0)
+        active = owned
+    try:
+        prompt = _build_cluster_prompt(hits, session=active)
+        try:
+            text = llm.run(prompt, client=llm_client).strip()
+        except Exception as exc:
+            logger.warning("SEC cluster brief failed for %s: %s", symbol, exc)
+            raise BriefUnavailable(str(exc)) from exc
+        if not text:
+            raise BriefUnavailable("empty analysis")
+        generated_at = datetime.now(timezone.utc)
+        if key is not None:
+            _save_brief(key, text, generated_at)
+        return Brief(text=text, generated_at=generated_at)
+    finally:
+        if owned is not None:
+            owned.close()
+
+
+def _load_review_prompt() -> str:
+    return REVIEW_PROMPT_PATH.read_text(encoding="utf-8").strip()
+
+
+def _will_show(score: int) -> bool:
+    return score > get_settings().sec_significance_min
+
+
+def _candidate_for_url(symbol: str, url: str, *, session: Any) -> FilingRef:
+    """The in-window candidate whose index URL is ``url``."""
+    info = edgar.get_filings(symbol, session=session)
+    settings = get_settings()
+    today = date.today()
+    for cand in info.candidates:
+        try:
+            age = (today - date.fromisoformat(cand.date)).days
+        except (TypeError, ValueError):
+            continue
+        if age > settings.sec_significance_recent_days:
+            break
+        if cand.url == url:
+            return cand
+    raise FilingNotFound(url)
+
+
+def _parse_review(text: str) -> tuple[bool, int, str, str] | None:
+    """Extract ``{agrees, score, direction, reason}`` from model output, or None."""
+    cleaned = _FENCE_RE.sub("", text).strip()
+    match = _OBJ_RE.search(cleaned)
+    if match is None:
+        return None
+    try:
+        obj = json.loads(match.group(0))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict) or "score" not in obj or "agrees" not in obj:
+        return None
+    agrees_raw = obj.get("agrees")
+    if isinstance(agrees_raw, bool):
+        agrees = agrees_raw
+    elif isinstance(agrees_raw, str) and agrees_raw.strip().lower() in ("true", "false", "yes", "no"):
+        agrees = agrees_raw.strip().lower() in ("true", "yes")
+    else:
+        return None
+    reason = str(obj.get("reason") or "").strip()[:500]
+    if not reason:
+        return None
+    return agrees, _clamp_score(obj.get("score")), _normalize_direction(obj.get("direction")), reason
+
+
+def _build_review_prompt(cand: FilingRef, current: tuple[int, str, str], text: str) -> str:
+    score, direction, reason = current
+    header = "\n".join(
+        [
+            f"Form: {cand.form}",
+            f"Filing date: {cand.date}",
+            f"Current score: {score}/100",
+            f"Current direction: {direction}",
+            f"Current reason: {reason}",
+            "",
+            "Filing text (truncated):",
+            text,
+        ]
+    )
+    return f"{_load_review_prompt()}\n\n{header}"
+
+
+def review_filing(
+    symbol: str,
+    url: str,
+    *,
+    session: Any = None,
+    llm_client: Any = None,
+) -> Review:
+    """Second read of one filing. Does not change the stored score.
+
+    Raises ``FilingNotFound`` when ``url`` is not an in-window candidate.
+    Raises ``ReviewUnavailable`` when the document or the model call fails.
+    """
+    symbol = symbol.strip().upper()
+    owned: httpx.Client | None = None
+    active = session
+    if active is None:
+        owned = httpx.Client(timeout=30.0)
+        active = owned
+    try:
+        cand = _candidate_for_url(symbol, url, session=active)
+        current = _score_one(cand, session=active, llm_client=llm_client)
+        doc = edgar.fetch_document_text(cand.doc_url, session=active)
+        if not doc.text:
+            raise ReviewUnavailable("filing text unavailable")
+        prompt = _build_review_prompt(cand, current, doc.text)
+        try:
+            raw = llm.run(prompt, client=llm_client)
+        except Exception as exc:
+            logger.warning("SEC filing review failed for %s: %s", cand.accession, exc)
+            raise ReviewUnavailable(str(exc)) from exc
+        parsed = _parse_review(raw)
+        if parsed is None:
+            logger.warning("SEC filing review: unparseable LLM output for %s", cand.accession)
+            raise ReviewUnavailable("unparseable review")
+        agrees, score, direction, reason = parsed
+        return Review(
+            agrees=agrees,
+            score=score,
+            direction=direction,
+            reason=reason,
+            will_show=_will_show(score),
+        )
+    finally:
+        if owned is not None:
+            owned.close()
+
+
+def apply_review(
+    symbol: str,
+    url: str,
+    result: tuple[int, str, str],
+    *,
+    session: Any = None,
+) -> Review:
+    """Replace the stored score for the filing at ``url``.
+
+    The row keeps the significance prompt key, so the next snapshot serves
+    this score instead of re-reading the filing. Raises ``FilingNotFound``
+    when the URL is not an in-window candidate, and ``ReviewUnavailable``
+    when the score cannot be stored.
+    """
+    symbol = symbol.strip().upper()
+    score, direction, reason = result
+    score = _clamp_score(score)
+    direction = _normalize_direction(direction)
+    reason = reason.strip()[:500]
+    if not reason:
+        raise ReviewUnavailable("empty reason")
+    owned: httpx.Client | None = None
+    active = session
+    if active is None:
+        owned = httpx.Client(timeout=30.0)
+        active = owned
+    try:
+        cand = _candidate_for_url(symbol, url, session=active)
+    finally:
+        if owned is not None:
+            owned.close()
+
+    key = _prompt_key()
+    if key is None:
+        raise ReviewUnavailable("score store unavailable")
+    stored = (score, direction, reason)
+    if not _save_stored(cand.accession, key, stored):
+        raise ReviewUnavailable("could not store the score")
+    _cache.put(cand.accession, stored)
+
+    from app.services import market_data
+
+    market_data.drop_snapshot(symbol)
+    return Review(
+        agrees=False,
+        score=score,
+        direction=direction,
+        reason=reason,
+        will_show=_will_show(score),
+    )

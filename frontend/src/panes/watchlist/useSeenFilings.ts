@@ -6,9 +6,9 @@ import { useCallback, useState } from "react";
 // watchlist's column-visibility prefs persist to localStorage.
 const STORAGE_KEY = "tf.seenFilings";
 
-function loadSeen(): Set<string> {
+function loadStored(key: string): Set<string> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(key);
     if (!raw) return new Set();
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? new Set(parsed.map(String)) : new Set();
@@ -17,12 +17,20 @@ function loadSeen(): Set<string> {
   }
 }
 
-function saveSeen(seen: Set<string>): void {
+function saveStored(key: string, ids: Set<string>): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...seen]));
+    localStorage.setItem(key, JSON.stringify([...ids]));
   } catch {
-    // Ignore quota/availability errors — seen-state is a nicety, not critical.
+    // Ignore quota/availability errors — this state is a nicety, not critical.
   }
+}
+
+function loadSeen(): Set<string> {
+  return loadStored(STORAGE_KEY);
+}
+
+function saveSeen(seen: Set<string>): void {
+  saveStored(STORAGE_KEY, seen);
 }
 
 export function useSeenFilings() {
@@ -40,5 +48,45 @@ export function useSeenFilings() {
     });
   }, []);
 
-  return { isSeen, markSeen };
+  const markSeenMany = useCallback((ids: string[]) => {
+    setSeen((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (!id || next.has(id)) continue;
+        next.add(id);
+        changed = true;
+      }
+      if (!changed) return prev;
+      saveSeen(next);
+      return next;
+    });
+  }, []);
+
+  return { isSeen, markSeen, markSeenMany };
+}
+
+const DISMISSED_KEY = "tf.dismissedFilings";
+
+export function useDismissedFilings() {
+  const [dismissed, setDismissed] = useState<Set<string>>(() => loadStored(DISMISSED_KEY));
+
+  const isDismissed = useCallback((id: string) => dismissed.has(id), [dismissed]);
+
+  const dismissMany = useCallback((ids: string[]) => {
+    setDismissed((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (!id || next.has(id)) continue;
+        next.add(id);
+        changed = true;
+      }
+      if (!changed) return prev;
+      saveStored(DISMISSED_KEY, next);
+      return next;
+    });
+  }, []);
+
+  return { isDismissed, dismissMany };
 }

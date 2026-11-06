@@ -1,26 +1,21 @@
-"""SEC EDGAR filing lookups for the watchlist Dilution Risk / SEC columns.
+"""SEC EDGAR filing lookups for the watchlist SEC column.
 
-This module owns the *filing* half of the dilution picture (the financial half
-— share issuance, buybacks, cash runway — comes from Unusual Whales via
-``app.services.dilution``, which combines the two). It reads the free SEC
-EDGAR APIs (no key; EDGAR only asks for a descriptive ``User-Agent`` and a
-10 req/s cap):
+It reads the free SEC EDGAR APIs (no key; EDGAR only asks for a descriptive
+``User-Agent`` and a 10 req/s cap):
 
 - ticker -> CIK map: ``/files/company_tickers.json`` (one global map, cached).
 - recent filings: ``/submissions/CIK##########.json`` -> ``filings.recent``.
 
-From those it returns dated filing records (form, filing date, accession,
-document URL, 8-K items) for ``app.services.dilution`` to score — this module
-holds no scoring logic — plus a capped, newest-first list of *significant*
-filing candidates. Which of those candidates is actually surfaced in the UI is
-decided downstream by ``app.services.sec_significance`` (it only surfaces
-filings scoring above a threshold).
+From those it returns a capped, newest-first list of *significant* filing
+candidates. This module holds no scoring logic. Which of those candidates is
+actually surfaced in the UI is decided downstream by
+``app.services.sec_significance`` (it only surfaces filings scoring above a
+threshold).
 
-This module can also fetch a filing's primary document text (for the LLM
-significance scorer and ``app.services.filing_checks``), keeping a small LRU
-of recent texts so both readers of one filing share a fetch, and exposes the
-throttled JSON GET that ``app.services.company_facts`` uses. All EDGAR
-requests pass through a small shared throttle to respect the 10 req/s cap.
+This module can also fetch a filing's primary document text for the LLM
+significance scorer, keeping a small LRU of recent texts, and exposes the
+throttled JSON GET. All EDGAR requests pass through a small shared throttle
+to respect the 10 req/s cap.
 
 Results are cached for ``TF_SEC_CACHE_TTL`` seconds (filings update at most
 daily). Lookups never raise: a missing CIK yields an empty ``FilingInfo``
@@ -51,7 +46,7 @@ DATA_BASE = "https://data.sec.gov"
 COMPANY_TICKERS_URL = f"{SEC_BASE}/files/company_tickers.json"
 SUBMISSIONS_URL = f"{DATA_BASE}/submissions/CIK{{cik10}}.json"
 
-# Forms that count as "significant" for the SEC column: dilution + catalyst.
+# Forms that count as "significant" for the SEC column.
 # Everything else (Form 4, 13F, SC 13D/G, ...) is noise for this feature.
 # Form D (private placements) is handled separately in _is_significant so the
 # "D" prefix can't swallow DEF 14A / DEFA14A.
@@ -70,18 +65,15 @@ _SIGNIFICANT_FORMS = {
 }
 _FORM_D_FORMS = {"D", "D/A"}
 
-# Filing records older than this are dropped (the longest dilution window is
-# the ~3-year shelf life).
-_RECORD_DAYS = 3 * 365 + 30
-
-# How many newest significant filings the significance scorer may consider.
-_MAX_CANDIDATES = 5
+# How many newest in-window significant filings the significance scorer may
+# consider. Older forms are not counted, so a stale filing cannot crowd out
+# one from the last TF_SEC_SIGNIFICANCE_RECENT_DAYS days.
+_MAX_CANDIDATES = 12
 # Default cap on stripped document text (cover page / 8-K item text / offering
 # summary live near the top; this keeps LLM token cost bounded).
 DOC_MAX_CHARS = 50_000
 # Recently fetched document texts (url -> (text, chars kept)). Filings are
-# immutable; this only needs to span one scoring pass (the significance scorer
-# and the keyword checks often open the same filing), so it stays small: proxy
+# immutable; this only needs to span one scoring pass, so it stays small: proxy
 # texts can be ~1M characters.
 _DOC_CACHE_MAX_ENTRIES = 32
 _doc_cache: BoundedLRU[str, tuple[str, int]] = BoundedLRU(_DOC_CACHE_MAX_ENTRIES)
@@ -120,19 +112,8 @@ class FilingRef:
 
 
 @dataclass(frozen=True)
-class FilingRecord:
-    """One dated filing of any form, for the dilution scorer."""
-
-    form: str
-    filed: date
-    accession: str
-    doc_url: str = ""  # full URL to the primary document ("" when none)
-    items: tuple[str, ...] = ()  # 8-K item codes, e.g. ("3.02",)
-
-
-@dataclass(frozen=True)
 class FilingInfo:
-    """Newest-first dated filing records + significant-filing candidates.
+    """Significant-filing candidates for one symbol.
 
     ``ok`` is False when the lookup failed (outage), as opposed to a symbol
     that simply has no CIK (``found`` False, ``ok`` True).
@@ -140,7 +121,6 @@ class FilingInfo:
 
     ok: bool = True
     found: bool = False
-    records: tuple[FilingRecord, ...] = field(default_factory=tuple)
     candidates: tuple[FilingRef, ...] = field(default_factory=tuple)
     cik: int | None = None
 
@@ -354,10 +334,19 @@ def _filing_url(cik: int, accession: str) -> str:
     return f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{acc_nodash}/{accession}-index.htm"
 
 
-def _build_candidates(filings: list[dict[str, Any]], cik: int) -> tuple[FilingRef, ...]:
-    """Newest-first significant filings, capped at ``_MAX_CANDIDATES``."""
+def _build_candidates(
+    filings: list[dict[str, Any]], cik: int, today: date
+) -> tuple[FilingRef, ...]:
+    """Newest-first significant filings inside the significance window.
+
+    The list stops at ``_MAX_CANDIDATES``. Filings are newest-first, so the
+    first one older than the window ends the scan and does not take a slot.
+    """
+    window = get_settings().sec_significance_recent_days
     refs: list[FilingRef] = []
     for f in filings:
+        if (today - f["date"]).days > window:
+            break
         if not _is_significant(f["form"]):
             continue
         primary_doc = f.get("primary_doc", "")
@@ -378,40 +367,19 @@ def _build_candidates(filings: list[dict[str, Any]], cik: int) -> tuple[FilingRe
     return tuple(refs)
 
 
-def _build_records(
-    filings: list[dict[str, Any]], cik: int, today: date
-) -> tuple[FilingRecord, ...]:
-    records: list[FilingRecord] = []
-    for f in filings:
-        if (today - f["date"]).days > _RECORD_DAYS:
-            break  # newest-first: everything after is older still
-        primary_doc = f.get("primary_doc", "")
-        records.append(
-            FilingRecord(
-                form=f["form"],
-                filed=f["date"],
-                accession=f["accession"],
-                doc_url=_document_url(cik, f["accession"], primary_doc) if primary_doc else "",
-                items=f.get("items", ()),
-            )
-        )
-    return tuple(records)
-
-
 def _build_filings(cik: int, session: _SessionProtocol, today: date) -> FilingInfo:
     submissions = http_get_json(SUBMISSIONS_URL.format(cik10=cik10(cik)), session=session)
     filings = _parse_recent_filings(submissions)
     return FilingInfo(
         ok=True,
         found=True,
-        records=_build_records(filings, cik, today),
-        candidates=_build_candidates(filings, cik),
+        candidates=_build_candidates(filings, cik, today),
         cik=cik,
     )
 
 
 def get_filings(symbol: str, *, session: _SessionProtocol | None = None) -> FilingInfo:
-    """Return dated filing records + candidates for ``symbol``.
+    """Return significant-filing candidates for ``symbol``.
 
     Empty (``found=False``) when the symbol has no CIK; failed (``ok=False``,
     not cached) on an EDGAR outage.

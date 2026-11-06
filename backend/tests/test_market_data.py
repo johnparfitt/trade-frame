@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import date
-
 import pandas as pd
 
 from app.services import market_data
@@ -27,24 +25,6 @@ def _history(days: int, splits: dict[str, float] | None = None) -> pd.DataFrame:
     for day, ratio in (splits or {}).items():
         df.loc[pd.Timestamp(day, tz="America/New_York"), "Stock Splits"] = ratio
     return df
-
-
-def test_splits_from_history_returns_dated_ratios():
-    hist = _history(250, {"2026-03-02": 0.05, "2026-07-01": 4.0})
-    assert market_data._splits_from_history(hist) == [
-        (date(2026, 3, 2), 0.05),
-        (date(2026, 7, 1), 4.0),
-    ]
-
-
-def test_splits_from_history_without_splits_is_empty():
-    assert market_data._splits_from_history(_history(250)) == []
-
-
-def test_splits_from_history_failed_fetch_is_none():
-    assert market_data._splits_from_history(None) is None
-    # yfinance can return an empty frame instead of raising.
-    assert market_data._splits_from_history(pd.DataFrame()) is None
 
 
 def test_atr_extension_uses_six_month_window_of_year_history():

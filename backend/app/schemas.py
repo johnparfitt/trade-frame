@@ -15,6 +15,74 @@ class SymbolInput(BaseModel):
         return v
 
 
+class SecFiling(BaseModel):
+    """One significant SEC filing inside the recency window."""
+
+    score: int
+    direction: str
+    reason: str
+    form: str
+    date: str
+    url: str
+
+
+class SecBrief(BaseModel):
+    """On-demand combined read of a symbol's current significant filings."""
+
+    text: str
+    generated_at: datetime
+
+
+class SecReviewRequest(BaseModel):
+    """Identify one surfaced filing by its EDGAR index URL."""
+
+    url: str = Field(..., min_length=1)
+
+
+class SecReview(BaseModel):
+    """A second read. The stored score is unchanged until the user confirms."""
+
+    agrees: bool
+    score: int
+    direction: str
+    reason: str
+    will_show: bool
+
+
+class SecScoreOverride(BaseModel):
+    """The second read the user chose to keep."""
+
+    url: str = Field(..., min_length=1)
+    score: int = Field(..., ge=0, le=100)
+    direction: str
+    reason: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("direction")
+    @classmethod
+    def normalize_direction(cls, v: str) -> str:
+        text = v.strip().lower()
+        if text not in ("bullish", "bearish", "neutral"):
+            raise ValueError("direction must be bullish, bearish, or neutral")
+        return text
+
+    @field_validator("reason")
+    @classmethod
+    def strip_reason(cls, v: str) -> str:
+        text = v.strip()
+        if not text:
+            raise ValueError("reason must not be blank")
+        return text
+
+
+class SecScoreApplied(BaseModel):
+    """The score now stored for that filing."""
+
+    score: int
+    direction: str
+    reason: str
+    will_show: bool
+
+
 class WatchlistRow(BaseModel):
     """A watchlist entry enriched with live market data (computed on read).
 
@@ -43,13 +111,12 @@ class WatchlistRow(BaseModel):
     short_pct_float: float | None = None  # % of float shorted
     days_to_cover: float | None = None  # short ratio
     gamma_magnet: float | None = None  # strike with the largest-magnitude net gamma
-    dilution_risk: float | None = None  # 0-100 SEC-derived dilution risk score
-    dilution_note: str | None = None  # human-readable drivers behind the score
     sec_filing_url: str | None = None  # link to the surfaced (significant) SEC filing
     sec_filing_form: str | None = None  # that filing's form type (e.g. "8-K")
     sec_filing_date: str | None = None  # that filing's ISO date
     sec_significance: int | None = None  # 0-100 LLM significance of that filing
     sec_significance_note: str | None = None  # why it is significant (hover)
     sec_significance_direction: str | None = None  # bullish | bearish | neutral
+    sec_filings: list[SecFiling] = Field(default_factory=list)  # in-window qualifiers, newest first
     added_at: datetime
     error: str | None = None  # populated if the symbol could not be resolved

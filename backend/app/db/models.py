@@ -78,20 +78,19 @@ class SecSignificanceScore(Base):
     scored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-class SecCachedResult(Base):
-    """A persisted SEC lookup result (a filing check or parsed company facts).
+class SecFilingBrief(Base):
+    """Combined LLM read of one set of significant filings.
 
-    ``version`` hashes the rules that produced ``payload`` (JSON); a lookup
-    under a different version is a miss, so editing keywords or tags re-checks.
+    ``filings_key`` hashes the sorted accessions plus the model and prompt, so
+    a new filing or an edited prompt is a miss and the previous brief is left
+    unused.
     """
 
-    __tablename__ = "sec_cached_results"
+    __tablename__ = "sec_filing_briefs"
 
-    kind: Mapped[str] = mapped_column(String(30), primary_key=True)
-    key: Mapped[str] = mapped_column(String(64), primary_key=True)
-    version: Mapped[str] = mapped_column(String(16), nullable=False)
-    payload: Mapped[str] = mapped_column(Text, nullable=False)
-    stored_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    filings_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class DailyReport(Base):

@@ -22,7 +22,6 @@ import httpx
 BASE_URL = "https://api.unusualwhales.com"
 DAILY_REPORT_PATH = "/api/market/daily-report"
 GEX_LEVELS_PATH = "/api/stock/{ticker}/gex-levels"
-FINANCIALS_PATH = "/api/stock/{ticker}/financials"
 UW_CLIENT_API_ID = "100001"
 # Redact bearer tokens if they ever surface in an error string.
 _BEARER_RE = re.compile(r"(Bearer\s+)[^\s'\"]+", re.IGNORECASE)
@@ -39,10 +38,6 @@ class UnusualWhalesClientProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def gex_levels(self, ticker: str, *, source: str = "oi") -> dict[str, Any]: ...
-
-    def financials(
-        self, ticker: str, *, report_type: str = "quarterly"
-    ) -> dict[str, Any]: ...
 
 
 class UnusualWhalesClient:
@@ -76,22 +71,6 @@ class UnusualWhalesClient:
         """
         payload = self._get(
             GEX_LEVELS_PATH.format(ticker=ticker.upper()), params={"source": source}
-        )
-        data = payload.get("data")
-        return data if isinstance(data, dict) else {}
-
-    def financials(
-        self, ticker: str, *, report_type: str = "quarterly"
-    ) -> dict[str, Any]:
-        """Return UW's financial statements ``data`` object for a ticker.
-
-        The ``data`` object holds ``balance_sheets``, ``cash_flows``,
-        ``income_statements``, and ``earnings`` lists (newest periods first).
-        ``report_type`` is ``quarterly`` (default) or ``annual``.
-        """
-        payload = self._get(
-            FINANCIALS_PATH.format(ticker=ticker.upper()),
-            params={"report_type": report_type},
         )
         data = payload.get("data")
         return data if isinstance(data, dict) else {}

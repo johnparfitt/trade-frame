@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # costs one Unusual Whales call per symbol.
     gex_cache_ttl: int = 900
 
-    # SEC EDGAR (watchlist Dilution Risk + SEC filing columns). Free, no key,
+    # SEC EDGAR (watchlist SEC column). Free, no key,
     # but EDGAR requires a descriptive User-Agent with contact info and caps
     # callers at 10 req/s — set TF_SEC_USER_AGENT to your own contact.
     sec_user_agent: str = "trade-frame/1.0 (contact: set TF_SEC_USER_AGENT)"
@@ -44,9 +44,9 @@ class Settings(BaseSettings):
     # form/8-K-item heuristic only (no LLM calls); needs TF_ANTHROPIC_API_KEY when on.
     sec_significance_enabled: bool = True
     sec_significance_min: int = 50
-    # Filings older than this many days are ignored (column stays blank), so the
-    # SEC column only ever surfaces a genuinely recent event.
-    sec_significance_recent_days: int = 14
+    # Filings older than this many days are ignored (column stays blank). The
+    # SEC column lists every filing in the window that scores above the minimum.
+    sec_significance_recent_days: int = 30
 
     # Breadth pane (Massive EOD grouped daily). Empty/unset disables refresh.
     massive_api_key: str | None = None

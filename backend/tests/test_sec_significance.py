@@ -128,17 +128,33 @@ def test_evaluate_blank_when_nothing_clears_threshold():
     assert res.score is None
 
 
-def test_evaluate_stops_at_first_qualifier():
-    first = _ref("424B5", _recent(1), "f1", doc="http://f1")
-    second = _ref("8-K", _recent(2), "f2", doc="http://f2")
-    session = _DocSession({"http://f1": "offering", "http://f2": "more"})
-    llm = _FakeLLM(lambda p: '{"score": 75, "direction": "bearish", "reason": "offering"}')
+def test_evaluate_returns_every_in_window_qualifier():
+    newest = _ref("424B5", _recent(1), "f1", doc="http://f1")
+    junk = _ref("10-Q", _recent(3), "junk", doc="http://junk")
+    older = _ref("8-K", _recent(8), "f2", doc="http://f2")
+    session = _DocSession(
+        {"http://f1": "FIRST offering", "http://junk": "routine quarterly", "http://f2": "SECOND offering"}
+    )
 
-    res = sec_significance.evaluate("T", [first, second], session=session, llm_client=llm)
+    def respond(prompt: str) -> str:
+        if "SECOND offering" in prompt:
+            return '{"score": 77, "direction": "bearish", "reason": "second offering"}'
+        if "routine quarterly" in prompt:
+            return '{"score": 20, "reason": "routine"}'
+        return '{"score": 85, "direction": "bearish", "reason": "first offering"}'
 
-    assert res.score == 75
-    assert len(llm.calls) == 1  # the second (older) candidate is never scored
-    assert "http://f2" not in session.gets
+    llm = _FakeLLM(respond)
+    res = sec_significance.evaluate("T", [newest, junk, older], session=session, llm_client=llm)
+
+    assert res.score == 85
+    assert res.url == newest.url
+    assert "first offering" in (res.note or "")
+    assert "second offering" not in (res.note or "")
+    assert [(f.score, f.reason, f.url) for f in res.filings] == [
+        (85, "first offering", newest.url),
+        (77, "second offering", older.url),
+    ]
+    assert len(llm.calls) == 3  # the below-threshold filing is scored, then omitted
 
 
 def test_evaluate_caches_by_accession():
@@ -254,7 +270,7 @@ def test_evaluate_empty_candidates_is_blank():
 
 
 def test_evaluate_ignores_filings_older_than_window():
-    # Older than the default 14-day window: must be blank and never scored.
+    # Older than the default 30-day window: must be blank and never scored.
     cand = _ref("424B5", _recent(40), "accOld", doc="http://old")
     session = _DocSession({"http://old": "offering"})
     llm = _FakeLLM(lambda p: '{"score": 95, "direction": "bearish", "reason": "offering"}')
@@ -269,7 +285,7 @@ def test_evaluate_ignores_filings_older_than_window():
 def test_evaluate_stops_scan_at_first_stale_candidate():
     # Newest-first: once a stale one is hit, the rest (older) are skipped too.
     fresh_junk = _ref("8-K", _recent(1), "fresh", doc="http://fresh")
-    stale_real = _ref("424B5", _recent(30), "stale", doc="http://stale")
+    stale_real = _ref("424B5", _recent(31), "stale", doc="http://stale")
     session = _DocSession({"http://fresh": "routine", "http://stale": "offering"})
     llm = _FakeLLM(lambda p: '{"score": 20, "reason": "routine"}' if "routine" in p else '{"score": 95, "direction": "bearish", "reason": "offering"}')
 

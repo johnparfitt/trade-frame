@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import threading
+import time
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+from app.db.models import SecFilingBrief, SecSignificanceScore
 from app.db.session import Base, get_db
 from app.main import app
+from app.services import edgar, llm, market_data, sec_significance
+from app.services.edgar import FilingInfo, FilingRef
 from app.services.market_data import SymbolSnapshot
+from app.services.sec_significance import SecFiling
 
 KNOWN = {"AAPL", "MSFT"}
 
@@ -34,14 +40,30 @@ def _snapshot(symbol: str) -> SymbolSnapshot:
         short_pct_float=0.8,
         days_to_cover=1.2,
         gamma_magnet=195.0,
-        dilution_risk=35.0,
-        dilution_note="Shares +10% YoY; active S-3 shelf",
         sec_filing_url="https://www.sec.gov/Archives/edgar/data/320193/x/y-index.htm",
         sec_filing_form="8-K",
         sec_filing_date="2026-09-30",
         sec_significance=82,
         sec_significance_note="Significance 82/100 (bearish)\n8-K filed 2026-09-30\nPriced offering",
         sec_significance_direction="bearish",
+        sec_filings=(
+            SecFiling(
+                score=82,
+                direction="bearish",
+                reason="Priced offering",
+                form="8-K",
+                date="2026-09-30",
+                url="https://www.sec.gov/Archives/edgar/data/320193/x/y-index.htm",
+            ),
+            SecFiling(
+                score=70,
+                direction="bearish",
+                reason="Shelf registration",
+                form="S-3",
+                date="2026-09-20",
+                url="https://www.sec.gov/Archives/edgar/data/320193/x/shelf-index.htm",
+            ),
+        ),
         error=None,
     )
 
@@ -91,6 +113,8 @@ def test_add_then_list(client: TestClient):
     body = res.json()
     assert body["symbol"] == "AAPL"
     assert body["company"] == "Apple Inc."
+    assert [f["score"] for f in body["sec_filings"]] == [82, 70]
+    assert body["sec_filings"][1]["form"] == "S-3"
 
     listed = client.get("/api/watchlist")
     assert listed.status_code == 200
@@ -180,3 +204,181 @@ def test_symbol_stored_uppercase(client: TestClient):
     assert res.status_code == 201
     assert res.json()["symbol"] == "AAPL"
     assert client.get("/api/watchlist").json()[0]["symbol"] == "AAPL"
+
+
+def _filing_info(*pairs: tuple[str, int, str]) -> FilingInfo:
+    today = date.today()
+    refs = tuple(
+        FilingRef(
+            form="8-K",
+            date=(today - timedelta(days=days)).isoformat(),
+            url=f"https://www.sec.gov/{accession}-index.htm",
+            accession=accession,
+            primary_doc="x.htm",
+            doc_url=url,
+        )
+        for accession, days, url in pairs
+    )
+    return FilingInfo(ok=True, found=True, candidates=refs, cik=1)
+
+
+def _patch_filings(monkeypatch, info: FilingInfo, run) -> None:
+    sec_significance.clear_cache()
+    monkeypatch.setattr(sec_significance.edgar, "get_filings", lambda symbol, session=None: info)
+    monkeypatch.setattr(
+        sec_significance.edgar,
+        "fetch_document_text",
+        lambda url, *, session, max_chars=edgar.DOC_MAX_CHARS: edgar.DocText(text=f"body {url}"),
+    )
+    monkeypatch.setattr(sec_significance.llm, "run", run)
+
+
+def _brief_rows(significance_store) -> list[SecFilingBrief]:
+    with significance_store() as db:
+        return list(db.execute(select(SecFilingBrief)).scalars().all())
+
+
+def test_sec_brief_persists_and_second_call_skips_llm(client, monkeypatch, significance_store):
+    calls: list[str] = []
+
+    def run(prompt: str, *, model=None, client=None) -> str:  # noqa: ARG001
+        calls.append(prompt)
+        if "Filing 1" in prompt:
+            return "Shelf last week, takedown today."
+        if "http://d1" in prompt:
+            return '{"score": 85, "direction": "bearish", "reason": "takedown"}'
+        return '{"score": 80, "direction": "bearish", "reason": "shelf"}'
+
+    _patch_filings(
+        monkeypatch,
+        _filing_info(("acc-a", 1, "http://d1"), ("acc-b", 8, "http://d2")),
+        run,
+    )
+
+    first = client.post("/api/watchlist/META/sec-brief")
+    assert first.status_code == 200
+    assert first.json()["text"] == "Shelf last week, takedown today."
+    assert len(calls) == 3  # two scores, then the combined read
+    assert len(_brief_rows(significance_store)) == 1
+
+    second = client.post("/api/watchlist/META/sec-brief")
+    assert second.status_code == 200
+    assert second.json()["text"] == first.json()["text"]
+    assert len(calls) == 3
+
+
+def test_sec_brief_one_qualifier_is_404(client, monkeypatch, significance_store):
+    def run(prompt: str, *, model=None, client=None) -> str:  # noqa: ARG001
+        return '{"score": 80, "direction": "bearish", "reason": "offering"}'
+
+    _patch_filings(monkeypatch, _filing_info(("acc-only", 1, "http://only")), run)
+
+    res = client.post("/api/watchlist/META/sec-brief")
+    assert res.status_code == 404
+    assert _brief_rows(significance_store) == []
+
+
+def test_sec_brief_failure_is_not_stored(client, monkeypatch, significance_store):
+    def run(prompt: str, *, model=None, client=None) -> str:  # noqa: ARG001
+        if "Filing 1" in prompt:
+            raise llm.LLMError("down")
+        return '{"score": 80, "direction": "bearish", "reason": "offering"}'
+
+    _patch_filings(
+        monkeypatch,
+        _filing_info(("acc-x", 1, "http://x"), ("acc-y", 6, "http://y")),
+        run,
+    )
+
+    res = client.post("/api/watchlist/META/sec-brief")
+    assert res.status_code == 503
+    assert _brief_rows(significance_store) == []
+
+
+def _score_rows(significance_store) -> list[SecSignificanceScore]:
+    with significance_store() as db:
+        return list(db.execute(select(SecSignificanceScore)).scalars().all())
+
+
+def _review_run(prompt: str, *, model=None, client=None) -> str:  # noqa: ARG001
+    if "agree with the current analysis" in prompt:
+        return (
+            '{"agrees": false, "score": 28, "direction": "bullish",'
+            ' "reason": "It is a buyback"}'
+        )
+    return '{"score": 82, "direction": "bearish", "reason": "treasury dilution"}'
+
+
+def test_sec_review_does_not_change_the_stored_score(client, monkeypatch, significance_store):
+    calls: list[str] = []
+
+    def run(prompt: str, *, model=None, client=None) -> str:  # noqa: ARG001
+        calls.append(prompt)
+        return _review_run(prompt)
+
+    _patch_filings(monkeypatch, _filing_info(("acc-a", 1, "http://d1")), run)
+    url = "https://www.sec.gov/acc-a-index.htm"
+
+    res = client.post("/api/watchlist/META/sec-review", json={"url": url})
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["agrees"] is False
+    assert body["score"] == 28
+    assert body["direction"] == "bullish"
+    assert body["will_show"] is False
+    assert "treasury dilution" in calls[-1]
+    rows = _score_rows(significance_store)
+    assert len(rows) == 1
+    assert rows[0].score == 82
+    assert rows[0].direction == "bearish"
+
+
+def test_sec_review_apply_replaces_the_score(client, monkeypatch, significance_store):
+    _patch_filings(monkeypatch, _filing_info(("acc-a", 1, "http://d1")), _review_run)
+    url = "https://www.sec.gov/acc-a-index.htm"
+    market_data._cache["META"] = (time.monotonic() + 30, SymbolSnapshot(symbol="META"))
+
+    res = client.post(
+        "/api/watchlist/META/sec-review/apply",
+        json={"url": url, "score": 28, "direction": "bullish", "reason": "It is a buyback"},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["will_show"] is False
+    rows = _score_rows(significance_store)
+    assert len(rows) == 1
+    assert rows[0].accession == "acc-a"
+    assert rows[0].score == 28
+    assert rows[0].direction == "bullish"
+    assert rows[0].reason == "It is a buyback"
+    assert "META" not in market_data._cache
+
+
+def test_sec_review_unknown_filing_is_404(client, monkeypatch, significance_store):
+    _patch_filings(monkeypatch, _filing_info(("acc-a", 1, "http://d1")), _review_run)
+
+    res = client.post(
+        "/api/watchlist/META/sec-review",
+        json={"url": "https://www.sec.gov/missing-index.htm"},
+    )
+
+    assert res.status_code == 404
+    assert _score_rows(significance_store) == []
+
+
+def test_sec_review_failure_leaves_the_score(client, monkeypatch, significance_store):
+    def run(prompt: str, *, model=None, client=None) -> str:  # noqa: ARG001
+        if "agree with the current analysis" in prompt:
+            raise llm.LLMError("down")
+        return '{"score": 82, "direction": "bearish", "reason": "treasury dilution"}'
+
+    _patch_filings(monkeypatch, _filing_info(("acc-a", 1, "http://d1")), run)
+    url = "https://www.sec.gov/acc-a-index.htm"
+
+    res = client.post("/api/watchlist/META/sec-review", json={"url": url})
+
+    assert res.status_code == 503
+    rows = _score_rows(significance_store)
+    assert len(rows) == 1
+    assert rows[0].score == 82

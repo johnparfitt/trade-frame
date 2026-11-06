@@ -99,35 +99,6 @@ def test_gex_levels_returns_empty_dict_when_data_is_not_an_object():
         client.close()
 
 
-def test_financials_sends_report_type_and_returns_data():
-    seen: dict = {}
-    data = {"balance_sheets": [{"ticker": "AAPL"}], "cash_flows": []}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        return httpx.Response(200, json={"data": data})
-
-    client = _client(handler)
-    try:
-        assert client.financials("aapl") == data
-    finally:
-        client.close()
-
-    assert "/api/stock/AAPL/financials" in seen["url"]
-    assert "report_type=quarterly" in seen["url"]
-
-
-def test_financials_returns_empty_dict_when_data_is_not_an_object():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": None})
-
-    client = _client(handler)
-    try:
-        assert client.financials("AAPL") == {}
-    finally:
-        client.close()
-
-
 def test_redact_secrets_strips_bearer_token():
     raw = "error for request with header Authorization: Bearer super-secret-token"
     out = redact_secrets(raw)

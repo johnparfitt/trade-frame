@@ -108,7 +108,16 @@ def test_parse_recent_filings_carries_primary_doc_and_items():
 # --- get_filings end to end -------------------------------------------------
 
 
-def test_get_filings_builds_records_and_candidates():
+def test_get_filings_builds_candidates(monkeypatch):
+    monkeypatch.setattr(
+        edgar,
+        "get_settings",
+        lambda: type(
+            "S",
+            (),
+            {"sec_cache_ttl": 21600, "sec_user_agent": "test", "sec_significance_recent_days": 30},
+        )(),
+    )
     today = date.today()
     session = _FakeSession(
         tickers=_tickers("TEST", 320193),
@@ -138,22 +147,54 @@ def test_get_filings_builds_records_and_candidates():
     assert info.ok is True and info.found is True
     assert info.cik == 320193
 
-    # Records: every form, newest-first, dated, older than the longest window dropped.
-    assert [r.form for r in info.records] == ["4", "8-K", "D", "424B5", "S-1", "S-3", "424B5", "424B5"]
-    eight_k = info.records[1]
-    assert eight_k.filed == today - timedelta(days=5)
-    assert eight_k.items == ("3.02", "9.01")
-    assert eight_k.doc_url.endswith("000119312525000001/a.htm")
-    assert info.records[2].doc_url == ""  # no primary document
-
-    # Candidates: newest-first, Form 4 skipped, capped at _MAX_CANDIDATES.
-    assert len(info.candidates) == edgar._MAX_CANDIDATES
+    # Candidates: in-window only, newest-first, Form 4 skipped. Day 60+ is outside
+    # the 30-day window and must not take a slot.
+    assert [c.accession for c in info.candidates] == [
+        "0001193125-25-000001",
+        "0001193125-25-000007",
+        "0001193125-25-000002",
+    ]
     assert info.candidates[0].form == "8-K"
     assert info.candidates[0].items == ("3.02", "9.01")
     assert info.candidates[0].accession == "0001193125-25-000001"
     assert info.candidates[0].doc_url.endswith("000119312525000001/a.htm")
     assert info.candidates[0].url.endswith("0001193125-25-000001-index.htm")
     assert all(edgar._is_significant(c.form) for c in info.candidates)
+
+
+def test_candidates_keep_the_window_and_cap_at_twelve(monkeypatch):
+    monkeypatch.setattr(
+        edgar,
+        "get_settings",
+        lambda: type(
+            "S",
+            (),
+            {"sec_cache_ttl": 21600, "sec_user_agent": "test", "sec_significance_recent_days": 30},
+        )(),
+    )
+    today = date.today()
+    rows = [_row("8-K", today - timedelta(days=i), f"acc-{i:02d}") for i in range(13)]
+    rows.append(_row("S-1", today - timedelta(days=40), "acc-old"))
+    info = edgar.get_filings(
+        "TEST",
+        session=_FakeSession(tickers=_tickers("TEST", 320193), submissions=_submissions(rows)),
+    )
+
+    assert [c.accession for c in info.candidates] == [f"acc-{i:02d}" for i in range(12)]
+    assert "acc-old" not in {c.accession for c in info.candidates}
+
+    # Fewer than 12 in-window filings: older forms must not fill the remaining slots.
+    edgar.clear_cache()
+    in_window = [_row("8-K", today - timedelta(days=i), f"in-{i}") for i in range(11)]
+    older = [_row("S-3", today - timedelta(days=40 + i), f"old-{i}") for i in range(5)]
+    rest = edgar.get_filings(
+        "OTHER",
+        session=_FakeSession(
+            tickers=_tickers("OTHER", 1),
+            submissions=_submissions(in_window + older),
+        ),
+    )
+    assert [c.accession for c in rest.candidates] == [f"in-{i}" for i in range(11)]
 
 
 def test_get_filings_no_cik_is_empty_not_failed():
@@ -173,7 +214,7 @@ def test_get_filings_outage_is_failed_and_not_cached():
     assert info.ok is False
     good = _FakeSession(
         tickers=_tickers("TEST", 320193),
-        submissions=_submissions([_row("10-K", date(2025, 1, 1), "acc")]),
+        submissions=_submissions([_row("10-K", date.today(), "acc")]),
     )
     assert edgar.get_filings("TEST", session=good).candidates[0].form == "10-K"
 

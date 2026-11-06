@@ -2,9 +2,10 @@
 
 Returns a SymbolSnapshot (company, industry, % change, RVOL) for a symbol,
 with a short TTL in-memory cache so polling the watchlist doesn't refetch on
-every request. yfinance (no API key) supplies everything except the gamma
-level (`gamma_magnet`), which comes from Unusual Whales
-via `app.services.gex` and are None unless TF_UW_API_KEY is set.
+every request. yfinance (no API key) supplies the price metrics.
+`gamma_magnet` comes from Unusual Whales via `app.services.gex` and is None
+unless `TF_UW_API_KEY` is set. The SEC column comes from
+`app.services.sec_significance`.
 """
 
 from __future__ import annotations
@@ -12,13 +13,14 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import yfinance as yf
 
 from app.config import get_settings
-from app.services import dilution, gex
+from app.services import gex, sec_significance
+from app.services.sec_significance import SecFiling
 
 settings = get_settings()
 
@@ -53,14 +55,13 @@ class SymbolSnapshot:
     short_pct_float: float | None = None  # % of float shorted
     days_to_cover: float | None = None  # short ratio (days to cover)
     gamma_magnet: float | None = None  # strike with the largest-magnitude net gamma (UW)
-    dilution_risk: float | None = None  # 0-100 SEC-derived dilution risk score
-    dilution_note: str | None = None  # human-readable drivers behind the score
     sec_filing_url: str | None = None  # link to the surfaced (significant) SEC filing
     sec_filing_form: str | None = None  # that filing's form type (e.g. "8-K")
     sec_filing_date: str | None = None  # that filing's ISO date
     sec_significance: int | None = None  # 0-100 LLM significance of that filing
     sec_significance_note: str | None = None  # why it is significant (hover)
     sec_significance_direction: str | None = None  # bullish | bearish | neutral
+    sec_filings: tuple[SecFiling, ...] = ()  # every in-window qualifier, newest first
     error: str | None = None
 
 
@@ -84,6 +85,12 @@ def _cache_get(symbol: str) -> SymbolSnapshot | None:
 def _cache_put(symbol: str, snapshot: SymbolSnapshot) -> None:
     with _cache_lock:
         _cache[symbol] = (time.monotonic() + settings.snapshot_cache_ttl, snapshot)
+
+
+def drop_snapshot(symbol: str) -> None:
+    """Drop one symbol so the next watchlist read rebuilds it."""
+    with _cache_lock:
+        _cache.pop(symbol.strip().upper(), None)
 
 
 def _fi_get(fi, *keys: str):
@@ -177,28 +184,9 @@ def _next_earnings(info: dict) -> str | None:
 
 
 def _year_history(ticker: yf.Ticker) -> Any:
-    """One year of daily bars; one fetch serves the ATR metric and split history.
-
-    A year covers the dilution score's 12-month reverse-split window. Reading
-    ``Ticker.splits`` instead would download the symbol's entire price history.
-    """
+    """One year of daily bars for the ATR metric."""
     try:
         return ticker.history(period="1y", interval="1d")
-    except Exception:
-        return None
-
-
-def _splits_from_history(hist: Any) -> list[tuple[date, float]] | None:
-    """``(date, new/old ratio)`` splits in ``hist``; None when the fetch failed.
-
-    yfinance can return an empty frame instead of raising, so a frame without
-    the "Stock Splits" column counts as failed, not as "no splits".
-    """
-    if hist is None or "Stock Splits" not in hist.columns:
-        return None
-    try:
-        col = hist["Stock Splits"]
-        return [(ts.date(), float(ratio)) for ts, ratio in col[col != 0].items()]
     except Exception:
         return None
 
@@ -353,20 +341,14 @@ def get_snapshot(symbol: str) -> SymbolSnapshot:
             snapshot.days_to_cover = days_to_cover
             levels = gex.get_levels(symbol)
             snapshot.gamma_magnet = levels.gamma_magnet
-            dil = dilution.get_dilution(
-                symbol,
-                price=last,
-                market_cap=_as_float(info.get("marketCap")),
-                splits=_splits_from_history(year_history),
-            )
-            snapshot.dilution_risk = dil.dilution_risk
-            snapshot.dilution_note = dil.dilution_note
-            snapshot.sec_filing_url = dil.sec_filing_url
-            snapshot.sec_filing_form = dil.sec_filing_form
-            snapshot.sec_filing_date = dil.sec_filing_date
-            snapshot.sec_significance = dil.sec_significance
-            snapshot.sec_significance_note = dil.sec_significance_note
-            snapshot.sec_significance_direction = dil.sec_significance_direction
+            sig = sec_significance.lookup(symbol)
+            snapshot.sec_filing_url = sig.url
+            snapshot.sec_filing_form = sig.form
+            snapshot.sec_filing_date = sig.date
+            snapshot.sec_significance = sig.score
+            snapshot.sec_significance_note = sig.note
+            snapshot.sec_significance_direction = sig.direction
+            snapshot.sec_filings = sig.filings
     except Exception as exc:  # pragma: no cover - defensive
         snapshot.error = f"Lookup failed: {exc}"
 

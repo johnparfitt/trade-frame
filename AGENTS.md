@@ -74,76 +74,62 @@ replace that with a manual per-field mapping.
   comes from env, never from the skill. Daily-report analysis prompt:
   `prompts/unusual-whales/daily-report.md`. Product UI still follows Scope
   (no screener).
-- SEC EDGAR: the watchlist Dilution Risk + SEC columns come from the free
-  EDGAR APIs (`app/services/edgar.py`, filings + SEC link) — no key, but EDGAR
-  requires a descriptive `User-Agent` (config `TF_SEC_USER_AGENT`) and caps
-  callers at 10 req/s (`edgar.py` throttles every EDGAR call to 8 req/s; route
-  new EDGAR calls through `edgar.http_get_json` / `fetch_document_text`).
-  `edgar.py` returns a newest-first list of significant-filing *candidates*
-  (10-K/Q, 8-K, S-1/3, 424B, S-8, 14A/14C, Form D); it does not itself pick
-  the surfaced filing. Its document-text LRU is shared by the SEC scorer and
-  the dilution document checks (checks run first, so the scorer's read hits it).
-- Dilution Risk *score* (`app/services/dilution.py`): 0-100 in four capped
-  groups — Behavior 45 (UW share growth, SBC, cash runway), Overhang 15
-  (warrants, convertibles), Filings 30 (ATM / offering / shelf / S-1 / Form D /
-  8-K Item 3.02, scaled down for larger companies), Distress 15 (reverse
-  splits, proxy proposals) — clamped to 100, whole points, and the hover note
-  always adds up to the score. Inputs:
-  - UW financials (`/api/stock/{ticker}/financials`), so it needs
-    `TF_UW_API_KEY`. UW share counts are unreliable across splits, so a >40%
-    YoY change with a split in the window (or unknown split history) drops
-    the growth points with a "possible split" note.
-  - `app/services/company_facts.py`: EDGAR XBRL company facts (one call per
-    CIK, cached per latest periodic filing) for warrants, convertibles, and
-    the cover-page share count.
-  - `app/services/filing_checks.py`: keyword checks on filing text (424B
-    cover = ATM / equity / debt takedown, proxy = authorized-share increase /
-    reverse split proposed, 8-K Item 5.03 = reverse split), under a fixed
-    per-symbol fetch budget and cached per accession in a `lru.py`
-    `BoundedLRU`. An unfetchable document counts as equity and marks the
-    result degraded.
-  - Both persist results in SQLite via `app/services/sec_store.py`
-    (`sec_cached_results`), each row keyed to a hash of the module's
-    keywords/tags (`rules_version`), so editing those constants re-checks;
-    bump the module's `_LOGIC_REVISION` when changing check/parse logic the
-    constants don't capture. Unknowns and failed lookups are never persisted;
-    stored company facts expire after 30 days.
-  - Price, market cap, and split history passed in from `get_snapshot`
-    (splits come from its 1-year daily history; don't add a `Ticker.splits`
-    call — it downloads full max history).
-  On-demand during `get_snapshot`, cached `TF_SEC_CACHE_TTL` (10 minutes when
-  degraded); no scheduler. Never raises — a missing CIK/key or an outage
-  yields partial fields and an "unavailable" note, and the score is None (not
-  0) when no source has data. A transparent, tunable heuristic (constants in
-  `dilution.py`) that weights what a company actually does
-  (issuance/buybacks/burn) over the mere capacity to dilute (a boilerplate
-  shelf). Before changing weights, run the dev calibration script
-  (`backend/scripts/calibrate_dilution.py`: `sanity`, `backtest`, `tune`; live
-  network, not a product feature) and keep buyback large caps below 15.
+- SEC EDGAR: the watchlist SEC column comes from the free EDGAR APIs
+  (`app/services/edgar.py`) — no key, but EDGAR requires a descriptive
+  `User-Agent` (config `TF_SEC_USER_AGENT`) and caps callers at 10 req/s
+  (`edgar.py` throttles every EDGAR call to 8 req/s; route new EDGAR calls
+  through `edgar.http_get_json` / `fetch_document_text`). `edgar.py` returns a
+  newest-first list of significant-filing *candidates* (10-K/Q, 8-K, S-1/3,
+  424B, S-8, 14A/14C, Form D); it does not itself pick the surfaced filing.
+  Document text is cached in a small LRU for the SEC scorer. Successful filing
+  lists are cached for `TF_SEC_CACHE_TTL`. A failed lookup is not cached, so
+  the next snapshot retries.
 - SEC filing significance (the watchlist `SEC` column) is in
   `app/services/sec_significance.py`: an LLM reads the filing document and
   returns `{score, direction, reason}` — `score` is 0-100 *magnitude* of the
   potential move and `direction` is `bullish`/`bearish`/`neutral`. `evaluate()`
-  scans the EDGAR candidates newest-first and surfaces the newest filing that is
-  both within `TF_SEC_SIGNIFICANCE_RECENT_DAYS` (default 14; candidates are
+  scans the EDGAR candidates newest-first and keeps every filing that is both
+  within `TF_SEC_SIGNIFICANCE_RECENT_DAYS` (default 30; candidates are
   newest-first, so the scan stops at the first stale one) and scoring above
-  `TF_SEC_SIGNIFICANCE_MIN` (default 50), skipping worthless ones so the column
-  stays blank on quiet days and a real filing is never hidden behind a junk one.
-  The prompt deliberately forces earnings (results, earnings-date announcements,
-  guidance) and acquirer-side M&A (unless dilutive/transformational) below the
-  threshold. Scores are cached per accession (filings are immutable; ~1 LLM call
-  per new filing) in memory, and LLM scores also persist in SQLite
-  (`sec_significance_scores`, keyed to a model + prompt hash so editing the
-  prompt re-scores; heuristic fallbacks are never persisted). The scan stops at
-  the first qualifier. Resilient + never
-  raises: a missing/empty key, `TF_SEC_SIGNIFICANCE_ENABLED=false`, an outage, or
-  an unparseable response falls back to a deterministic form/8-K-item heuristic
-  (which carries a direction too). Keys from env (`TF_ANTHROPIC_API_KEY`, model
-  via `TF_LLM_MODEL`); the LLM call stays isolated in `llm.py` (`run()`).
-  On-demand during `get_snapshot`, no scheduler. Frontend surfaces it as a
-  direction-colored score (red bearish / green bullish / amber neutral) with a
-  recency dot, an unseen "look at me" pulse, and acknowledge-on-click (seen-state
-  persisted in `localStorage` by filing URL).
+  `TF_SEC_SIGNIFICANCE_MIN` (default 50). Worthless filings are skipped, so the
+  column stays blank on quiet days and a real filing is never hidden behind a
+  junk one. The cell's score, color, and hover note stay the newest qualifier;
+  `sec_filings` lists every qualifier in the window. EDGAR hands the scorer at
+  most 12 in-window candidates (`edgar._MAX_CANDIDATES`); older forms do not
+  take a slot. The prompt deliberately forces earnings (results, earnings-date
+  announcements, guidance) and acquirer-side M&A (unless dilutive/transformational)
+  below the threshold. Scores are cached per accession (filings are immutable;
+  ~1 LLM call per new filing in the window) in memory, and LLM scores also
+  persist in SQLite (`sec_significance_scores`, keyed to a model + prompt hash
+  so editing the prompt re-scores; heuristic fallbacks are never persisted).
+  Resilient + never raises: a missing/empty key, `TF_SEC_SIGNIFICANCE_ENABLED=false`,
+  an outage, or an unparseable response falls back to a deterministic
+  form/8-K-item heuristic (which carries a direction too). Keys from env
+  (`TF_ANTHROPIC_API_KEY`, model via `TF_LLM_MODEL`); the LLM call stays isolated
+  in `llm.py` (`run()`). On-demand during `get_snapshot`, no scheduler. Frontend
+  surfaces the newest score with a direction color (red bearish / green bullish /
+  amber neutral) and a pulsing dot while any filing from the last 7 days is
+  unseen (seen-state in `localStorage` by filing URL). Opening one filing marks
+  only that filing. More opens the list and does
+  not call the model. The list's Mark as read button, and a successful "Analyze
+  together", mark every filing in the cell seen. The score stays and the dot
+  goes away. Remove hides every filing URL in the cell (`localStorage`); the
+  column stays blank until a new filing URL arrives. The stored score is not
+  deleted. "Analyze
+  together" is a separate
+  `POST /api/watchlist/{symbol}/sec-brief` — it is not part of a watchlist
+  refresh. That call reads the filings together (`prompts/sec/cluster.md`,
+  about 8,000 characters of each document) and stores the text in
+  `sec_filing_briefs`, keyed by the sorted accessions plus the model and prompt,
+  so the same set is not analyzed again. A failed or disabled LLM call is not
+  stored. The cell score does not change. "Review" on one filing
+  (`POST /api/watchlist/{symbol}/sec-review`, prompt `prompts/sec/review.md`,
+  the same document cap as the first score) asks a second model whether it
+  agrees. That reply is not stored. Confirming replaces the accession's row
+  in `sec_significance_scores` (same prompt key, so the next snapshot serves
+  it). A replacement at or below the minimum leaves the column. One LLM call
+  per click, not cached. Editing `significance.md` later re-scores and drops
+  the override.
 - Daily Market Report (Report pane) uses UW `/api/market/daily-report` analyzed
   by an LLM with the `daily-report.md` prompt. Manual Generate button only (no
   scheduler). Keys from env: `TF_UW_API_KEY`, `TF_ANTHROPIC_API_KEY`; model via
