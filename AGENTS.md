@@ -109,9 +109,9 @@ replace that with a manual per-field mapping.
   in `llm.py` (`run()`). On-demand during `get_snapshot`, no scheduler. Frontend
   surfaces the newest score with a direction color (red bearish / green bullish /
   amber neutral) and a pulsing dot while any filing from the last 7 days is
-  unseen (seen-state in `localStorage` by filing URL). Opening one filing marks
-  only that filing. More opens the list and does
-  not call the model. The list's Mark as read button, and a successful "Analyze
+  unseen (seen-state in `localStorage` by filing URL). Clicking the score opens
+  the list and does not call the model. Opening one filing in that list marks
+  only that filing. The list's Mark as read button, and a successful "Analyze
   together", mark every filing in the cell seen. The score stays and the dot
   goes away. Remove hides every filing URL in the cell (`localStorage`); the
   column stays blank until a new filing URL arrives. The stored score is not

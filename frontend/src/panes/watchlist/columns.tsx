@@ -104,91 +104,6 @@ function significanceClass(direction: string | null, score: number | null): stri
   }
 }
 
-// Shared score cell: shows a number and, on hover, renders a multi-line note as
-// a styled tooltip. A portal is used so the tooltip escapes the table's
-// `overflow-hidden` wrapper, and it appears on hover immediately (the native
-// `title` tooltip was slow/unreliable). Optionally renders the number as a link
-// and shows a leading adornment (e.g. a recency/alert dot).
-function HoverScore({
-  label,
-  colorClass,
-  note,
-  href,
-  adornment,
-  onActivate,
-}: {
-  label: ReactNode;
-  colorClass: string;
-  note: string | null;
-  href?: string;
-  adornment?: ReactNode;
-  onActivate?: () => void;
-}) {
-  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
-  const lines = (note ?? "").split("\n").filter(Boolean);
-
-  function show(e: React.MouseEvent<HTMLSpanElement>) {
-    const r = e.currentTarget.getBoundingClientRect();
-    const x = Math.min(r.right, window.innerWidth - 8);
-    setPos({ x, y: r.bottom + 4 });
-  }
-
-  const inner = (
-    <>
-      {adornment}
-      <span>{label}</span>
-    </>
-  );
-
-  return (
-    <span
-      className="inline-flex cursor-default items-center justify-end gap-1"
-      onMouseEnter={show}
-      onMouseMove={show}
-      onMouseLeave={() => setPos(null)}
-    >
-      {href ? (
-        <a
-          href={href}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1 hover:underline"
-          onClick={onActivate}
-        >
-          {inner}
-        </a>
-      ) : (
-        inner
-      )}
-      {pos &&
-        lines.length > 0 &&
-        createPortal(
-          <div
-            className="pointer-events-none fixed z-50 w-max max-w-xl -translate-x-full rounded-md border border-slate-700 bg-slate-900/95 px-3 py-2 text-left text-xs leading-relaxed shadow-xl"
-            style={{ left: pos.x, top: pos.y }}
-          >
-            {lines.map((line, i) => {
-              if (i === 0) {
-                return (
-                  <div key={i} className={`mb-1 font-semibold ${colorClass}`}>
-                    {line}
-                  </div>
-                );
-              }
-              const info = line.startsWith("-");
-              return (
-                <div key={i} className={info ? "text-slate-500" : "text-slate-300"}>
-                  {line}
-                </div>
-              );
-            })}
-          </div>,
-          document.body,
-        )}
-    </span>
-  );
-}
-
 const RECENT_DAYS = 7;
 
 function daysSinceFiling(iso: string | null): number | null {
@@ -204,10 +119,11 @@ function daysSinceFiling(iso: string | null): number | null {
 
 // SEC cell: blank unless a filing cleared the significance bar. Shows the newest
 // score (color-coded) and a pulsing dot while any filing from the last 7 days
-// is unseen. More opens the list and does not call the model. Review, inside
-// that list, sends one filing for a second read. Mark as read (and a successful
-// Analyze together) marks every filing in the cell seen and removes the dot.
-// Remove hides those filings from the column until a new one arrives.
+// is unseen. Clicking the score opens the list and does not call the model.
+// Review, inside that list, sends one filing for a second read. Mark as read
+// (and a successful Analyze together) marks every filing in the cell seen and
+// removes the dot. Remove hides those filings from the column until a new one
+// arrives.
 function SecCell({ row }: { row: WatchlistRow }) {
   const { isSeen, markSeen, markSeenMany } = useSeenFilings();
   const { isDismissed, dismissMany } = useDismissedFilings();
@@ -237,46 +153,48 @@ function SecCell({ row }: { row: WatchlistRow }) {
   ) : null;
 
   return (
-    <span className="inline-flex items-center justify-end gap-1">
-      <HoverScore
-        label={String(row.sec_significance)}
-        colorClass={significanceClass(row.sec_significance_direction, row.sec_significance)}
-        note={row.sec_significance_note}
-        href={row.sec_filing_url}
-        adornment={dot}
-        onActivate={() => markSeen(row.sec_filing_url!)}
-      />
-      <SecFilingsMenu
-        row={row}
-        filings={listed}
-        markSeen={markSeen}
-        markRowRead={markRowRead}
-        onRemove={removeFilings}
-      />
-    </span>
+    <SecFilingsMenu
+      row={row}
+      filings={listed}
+      score={row.sec_significance}
+      note={row.sec_significance_note}
+      adornment={dot}
+      markSeen={markSeen}
+      markRowRead={markRowRead}
+      onRemove={removeFilings}
+    />
   );
 }
 
 function SecFilingsMenu({
   row,
   filings,
+  score,
+  note,
+  adornment,
   markSeen,
   markRowRead,
   onRemove,
 }: {
   row: WatchlistRow;
   filings: SecFiling[];
+  score: number;
+  note: string | null;
+  adornment?: ReactNode;
   markSeen: (id: string) => void;
   markRowRead: () => void;
   onRemove: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ x: number; y: number; above: boolean } | null>(null);
+  const [tip, setTip] = useState<{ x: number; y: number } | null>(null);
   const [brief, setBrief] = useState<string | null>(null);
   const [briefError, setBriefError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const colorClass = significanceClass(row.sec_significance_direction, score);
+  const noteLines = (note ?? "").split("\n").filter(Boolean);
 
   useEffect(() => {
     if (!open) return;
@@ -296,7 +214,14 @@ function SecFilingsMenu({
     };
   }, [open]);
 
+  function showTip(event: React.MouseEvent<HTMLButtonElement>) {
+    if (open) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setTip({ x: Math.min(rect.right, window.innerWidth - 8), y: rect.bottom + 4 });
+  }
+
   function toggle() {
+    setTip(null);
     const el = buttonRef.current;
     if (el) {
       const rect = el.getBoundingClientRect();
@@ -330,13 +255,39 @@ function SecFilingsMenu({
       <button
         ref={buttonRef}
         type="button"
-        className="rounded bg-slate-800 px-1 text-[10px] font-medium leading-4 text-slate-200 hover:bg-slate-700"
-        aria-label="More about this SEC filing"
+        className="inline-flex items-center justify-end gap-1 hover:underline"
+        aria-label="Significant SEC filings"
         aria-expanded={open}
         onClick={toggle}
+        onMouseEnter={showTip}
+        onMouseMove={showTip}
+        onMouseLeave={() => setTip(null)}
       >
-        More
+        {adornment}
+        {score}
       </button>
+      {!open &&
+        tip &&
+        noteLines.length > 0 &&
+        createPortal(
+          <div
+            className="pointer-events-none fixed z-50 w-max max-w-xl -translate-x-full rounded-md border border-slate-700 bg-slate-900/95 px-3 py-2 text-left text-xs leading-relaxed shadow-xl"
+            style={{ left: tip.x, top: tip.y }}
+          >
+            {noteLines.map((line, i) =>
+              i === 0 ? (
+                <div key={i} className={`mb-1 font-semibold ${colorClass}`}>
+                  {line}
+                </div>
+              ) : (
+                <div key={i} className="text-slate-300">
+                  {line}
+                </div>
+              ),
+            )}
+          </div>,
+          document.body,
+        )}
       {open &&
         pos &&
         createPortal(
@@ -712,7 +663,7 @@ export const ALL_COLUMNS: Column[] = [
     key: "sec_significance",
     label: "SEC",
     numeric: true,
-    width: 136,
+    width: 72,
     render: (r) => <SecCell row={r} />,
     cellClassName: (r) => significanceClass(r.sec_significance_direction, r.sec_significance),
   },
