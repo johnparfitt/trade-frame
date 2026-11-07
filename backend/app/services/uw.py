@@ -1,8 +1,9 @@
 """Thin Unusual Whales HTTP client.
 
-Covers the Daily Market Report digest (``/api/market/daily-report``) and the
+Covers the Daily Market Report digest (``/api/market/daily-report``), the
 per-ticker gamma levels (``/api/stock/{ticker}/gex-levels``) behind the
-watchlist Gamma Magnet column. Tests inject a fake
+watchlist Gamma Magnet column, and analyst ratings
+(``/api/screener/analysts``) behind the Analysts column. Tests inject a fake
 ``httpx.Client``; this module is the only place that talks to
 api.unusualwhales.com.
 
@@ -22,6 +23,7 @@ import httpx
 BASE_URL = "https://api.unusualwhales.com"
 DAILY_REPORT_PATH = "/api/market/daily-report"
 GEX_LEVELS_PATH = "/api/stock/{ticker}/gex-levels"
+ANALYST_RATINGS_PATH = "/api/screener/analysts"
 UW_CLIENT_API_ID = "100001"
 # Redact bearer tokens if they ever surface in an error string.
 _BEARER_RE = re.compile(r"(Bearer\s+)[^\s'\"]+", re.IGNORECASE)
@@ -38,6 +40,10 @@ class UnusualWhalesClientProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     def gex_levels(self, ticker: str, *, source: str = "oi") -> dict[str, Any]: ...
+
+    def analyst_ratings(
+        self, ticker: str, *, newer_than: str, limit: int = 500
+    ) -> list[dict[str, Any]]: ...
 
 
 class UnusualWhalesClient:
@@ -74,6 +80,28 @@ class UnusualWhalesClient:
         )
         data = payload.get("data")
         return data if isinstance(data, dict) else {}
+
+    def analyst_ratings(
+        self, ticker: str, *, newer_than: str, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """Return recent analyst ratings for one ticker.
+
+        ``newer_than`` is an ISO date (or RFC3339). ``limit`` caps the page at
+        500, which is also the API maximum. The watchlist scores the rows
+        itself; this method does not filter by action or analyst.
+        """
+        payload = self._get(
+            ANALYST_RATINGS_PATH,
+            params={
+                "ticker": ticker.upper(),
+                "newer_than": newer_than,
+                "limit": limit,
+            },
+        )
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return []
+        return [row for row in data if isinstance(row, dict)]
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         url = path if path.startswith("http") else f"{BASE_URL}{path}"

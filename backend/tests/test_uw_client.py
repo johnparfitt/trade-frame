@@ -99,6 +99,54 @@ def test_gex_levels_returns_empty_dict_when_data_is_not_an_object():
         client.close()
 
 
+def test_analyst_ratings_sends_ticker_window_and_returns_rows():
+    seen: dict = {}
+    rows = [
+        {
+            "action": "upgraded",
+            "analyst_name": "Dan Ives",
+            "timestamp": "2026-10-01T12:00:00.000Z",
+            "ticker": "NVDA",
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("Authorization")
+        seen["client_id"] = request.headers.get("UW-CLIENT-API-ID")
+        return httpx.Response(200, json={"data": rows})
+
+    client = _client(handler)
+    try:
+        assert client.analyst_ratings("nvda", newer_than="2026-09-07", limit=500) == rows
+    finally:
+        client.close()
+
+    assert "/api/screener/analysts" in seen["url"]
+    assert "ticker=NVDA" in seen["url"]
+    assert "newer_than=2026-09-07" in seen["url"]
+    assert "limit=500" in seen["url"]
+    assert seen["auth"] == "Bearer secret-token"
+    assert seen["client_id"] == UW_CLIENT_API_ID
+
+
+def test_analyst_ratings_drops_non_object_rows_and_a_non_list_payload():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "EMPTY" in str(request.url):
+            return httpx.Response(200, json={"data": {"not": "a list"}})
+        return httpx.Response(
+            200,
+            json={"data": [{"action": "upgraded"}, "skip-me", 3]},
+        )
+
+    client = _client(handler)
+    try:
+        assert client.analyst_ratings("NVDA", newer_than="2026-09-07") == [{"action": "upgraded"}]
+        assert client.analyst_ratings("EMPTY", newer_than="2026-09-07") == []
+    finally:
+        client.close()
+
+
 def test_redact_secrets_strips_bearer_token():
     raw = "error for request with header Authorization: Bearer super-secret-token"
     out = redact_secrets(raw)

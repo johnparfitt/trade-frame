@@ -36,7 +36,6 @@ def _snapshot(symbol: str) -> SymbolSnapshot:
         atr_pct_50=0.5,
         adr_pct=2.1,
         float_shares=15_000_000_000,
-        float_pct=99.0,
         short_pct_float=0.8,
         days_to_cover=1.2,
         gamma_magnet=195.0,

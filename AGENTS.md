@@ -74,6 +74,14 @@ replace that with a manual per-field mapping.
   comes from env, never from the skill. Daily-report analysis prompt:
   `prompts/unusual-whales/daily-report.md`. Product UI still follows Scope
   (no screener).
+- Watchlist Analysts column (`app/services/analysts.py`): net of `upgraded`
+  minus `downgraded` from a fixed name list over 60 days, via UW
+  `GET /api/screener/analysts` (one call per symbol, cached
+  `TF_ANALYST_CACHE_TTL`, default 1 hour). A missing key or a failed lookup
+  is blank, not zero. `analyst_upgrades` lists the upgrade ids; the cell
+  pulses until those ids are acknowledged in `localStorage`
+  (`tf.seenUpgrades`). Downgrades change the net and do not light the dot.
+  This is a per-symbol score, not a screener.
 - SEC EDGAR: the watchlist SEC column comes from the free EDGAR APIs
   (`app/services/edgar.py`) — no key, but EDGAR requires a descriptive
   `User-Agent` (config `TF_SEC_USER_AGENT`) and caps callers at 10 req/s

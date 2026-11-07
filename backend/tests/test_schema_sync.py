@@ -55,6 +55,9 @@ def _fully_populated_snapshot() -> SymbolSnapshot:
     """A SymbolSnapshot with every field set to a distinct, type-correct value."""
     values: dict[str, object] = {}
     for f in dataclasses.fields(SymbolSnapshot):
+        if f.name == "analyst_upgrades":
+            values[f.name] = ("NVDA|dan ives|2026-11-01T12:00:00Z",)
+            continue
         if f.name == "sec_filings":
             values[f.name] = (
                 SecFiling(
@@ -99,6 +102,9 @@ def test_build_row_carries_every_snapshot_value_through_unchanged():
     for f in dataclasses.fields(snap):
         got = getattr(row, f.name)
         want = getattr(snap, f.name)
+        if f.name == "analyst_upgrades":
+            assert list(got) == list(want)
+            continue
         if f.name == "sec_filings":
             assert [item.model_dump() for item in got] == [dataclasses.asdict(item) for item in want]
             continue

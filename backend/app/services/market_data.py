@@ -4,8 +4,9 @@ Returns a SymbolSnapshot (company, industry, % change, RVOL) for a symbol,
 with a short TTL in-memory cache so polling the watchlist doesn't refetch on
 every request. yfinance (no API key) supplies the price metrics.
 `gamma_magnet` comes from Unusual Whales via `app.services.gex` and is None
-unless `TF_UW_API_KEY` is set. The SEC column comes from
-`app.services.sec_significance`.
+unless `TF_UW_API_KEY` is set. `analyst_net` is the same key via
+`app.services.analysts` (upgrades minus downgrades, last 60 days). The SEC
+column comes from `app.services.sec_significance`.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any
 import yfinance as yf
 
 from app.config import get_settings
-from app.services import gex, sec_significance
+from app.services import analysts, gex, sec_significance
 from app.services.sec_significance import SecFiling
 
 settings = get_settings()
@@ -51,10 +52,11 @@ class SymbolSnapshot:
     atr_pct_50: float | None = None  # extension from 50 SMA in ATR%-of-price units
     adr_pct: float | None = None  # 20-day average daily range as % of close
     float_shares: int | None = None  # tradeable float (shares)
-    float_pct: float | None = None  # floatShares / sharesOutstanding as %
     short_pct_float: float | None = None  # % of float shorted
     days_to_cover: float | None = None  # short ratio (days to cover)
     gamma_magnet: float | None = None  # strike with the largest-magnitude net gamma (UW)
+    analyst_net: int | None = None  # upgrades minus downgrades, last 60 days (UW)
+    analyst_upgrades: tuple[str, ...] = ()  # ids of those upgrades (unseen-dot)
     sec_filing_url: str | None = None  # link to the surfaced (significant) SEC filing
     sec_filing_form: str | None = None  # that filing's form type (e.g. "8-K")
     sec_filing_date: str | None = None  # that filing's ISO date
@@ -143,25 +145,17 @@ def _compute_range_position(last: float | None, high: float | None, low: float |
     return None
 
 
-def _extract_float_metrics(info: dict) -> tuple[int | None, float | None, float | None, float | None]:
-    """Return (float_shares, float_pct, short_pct_float, days_to_cover)."""
+def _extract_float_metrics(info: dict) -> tuple[int | None, float | None, float | None]:
+    """Return (float_shares, short_pct_float, days_to_cover)."""
     float_shares = info.get("floatShares")
-    shares_out = info.get("sharesOutstanding")
     short_pct = info.get("shortPercentOfFloat")
     short_ratio = info.get("shortRatio")
 
     float_shares_int = int(float_shares) if float_shares else None
-
-    float_pct_val = None
-    if float_shares and shares_out:
-        so = float(shares_out)
-        if so:
-            float_pct_val = round(float(float_shares) / so * 100.0, 1)
-
     short_pct_float = round(float(short_pct) * 100.0, 1) if short_pct is not None else None
     days_to_cover = round(float(short_ratio), 1) if short_ratio is not None else None
 
-    return float_shares_int, float_pct_val, short_pct_float, days_to_cover
+    return float_shares_int, short_pct_float, days_to_cover
 
 
 def _next_earnings(info: dict) -> str | None:
@@ -319,7 +313,7 @@ def get_snapshot(symbol: str) -> SymbolSnapshot:
         high52 = _as_float(_fi_get(fi, "yearHigh")) or _as_float(info.get("fiftyTwoWeekHigh"))
         low52 = _as_float(_fi_get(fi, "yearLow")) or _as_float(info.get("fiftyTwoWeekLow"))
         avg_volume = info.get("averageVolume") or _fi_get(fi, "threeMonthAverageVolume")
-        float_shares, float_pct, short_pct_float, days_to_cover = _extract_float_metrics(info)
+        float_shares, short_pct_float, days_to_cover = _extract_float_metrics(info)
 
         # If we got nothing back at all, treat as an unresolved symbol.
         if company is None and pct_change is None and rvol is None and last is None:
@@ -336,11 +330,13 @@ def get_snapshot(symbol: str) -> SymbolSnapshot:
             snapshot.atr_pct_50 = atr_pct_50
             snapshot.adr_pct = adr_pct
             snapshot.float_shares = float_shares
-            snapshot.float_pct = float_pct
             snapshot.short_pct_float = short_pct_float
             snapshot.days_to_cover = days_to_cover
             levels = gex.get_levels(symbol)
             snapshot.gamma_magnet = levels.gamma_magnet
+            analyst = analysts.get_score(symbol)
+            snapshot.analyst_net = analyst.net
+            snapshot.analyst_upgrades = analyst.upgrades
             sig = sec_significance.lookup(symbol)
             snapshot.sec_filing_url = sig.url
             snapshot.sec_filing_form = sig.form

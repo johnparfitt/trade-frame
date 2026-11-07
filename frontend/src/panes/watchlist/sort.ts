@@ -12,10 +12,10 @@ export type SortKey =
   | "atr_pct_50"
   | "range_pct_52w"
   | "float_shares"
-  | "float_pct"
   | "short_pct_float"
   | "days_to_cover"
   | "gamma_magnet"
+  | "analyst_net"
   | "sec_significance"
   | "next_earnings";
 

@@ -66,6 +66,31 @@ export function useSeenFilings() {
   return { isSeen, markSeen, markSeenMany };
 }
 
+const UPGRADES_KEY = "tf.seenUpgrades";
+
+export function useSeenUpgrades() {
+  const [seen, setSeen] = useState<Set<string>>(() => loadStored(UPGRADES_KEY));
+
+  const isSeen = useCallback((id: string) => seen.has(id), [seen]);
+
+  const markSeenMany = useCallback((ids: string[]) => {
+    setSeen((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (!id || next.has(id)) continue;
+        next.add(id);
+        changed = true;
+      }
+      if (!changed) return prev;
+      saveStored(UPGRADES_KEY, next);
+      return next;
+    });
+  }, []);
+
+  return { isSeen, markSeenMany };
+}
+
 const DISMISSED_KEY = "tf.dismissedFilings";
 
 export function useDismissedFilings() {

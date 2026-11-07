@@ -107,10 +107,11 @@ class WatchlistRow(BaseModel):
     atr_pct_50: float | None = None  # extension from 50 SMA in ATR%-of-price units
     adr_pct: float | None = None  # 20-day average daily range as % of close
     float_shares: int | None = None
-    float_pct: float | None = None  # floatShares / sharesOutstanding as %
     short_pct_float: float | None = None  # % of float shorted
     days_to_cover: float | None = None  # short ratio
     gamma_magnet: float | None = None  # strike with the largest-magnitude net gamma
+    analyst_net: int | None = None  # upgrades minus downgrades, last 60 days
+    analyst_upgrades: list[str] = Field(default_factory=list)  # ids of those upgrades
     sec_filing_url: str | None = None  # link to the surfaced (significant) SEC filing
     sec_filing_form: str | None = None  # that filing's form type (e.g. "8-K")
     sec_filing_date: str | None = None  # that filing's ISO date

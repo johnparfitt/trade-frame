@@ -1,6 +1,6 @@
 ---
 name: unusual-whales-api
-description: Query the Unusual Whales API for unusual options flow, dark pool prints, market tide, stock greek exposure, financial statements, and technical indicators.
+description: Query the Unusual Whales API for unusual options flow, dark pool prints, market tide, stock greek exposure, analyst ratings, financial statements, and technical indicators.
 ---
 
 # Unusual Whales API Skill
@@ -12,7 +12,7 @@ Use this skill when the user asks for financial data related to:
 - Unusual options activity, individual option trades, "whale" trades, flow alerts, or "hottest chains".
 - Dark pool prints, trades, or levels.
 - Market sentiment (Market Tide, Net Premium, Put/Call ratios).
-- Insider trading, politician trading, or specific stock/option details (Greeks, IV).
+- Insider trading, politician trading, analyst upgrades and downgrades, or specific stock/option details (Greeks, IV).
 - Company financial statements such as income statements, balance sheets, cash flows, earnings, or full financials.
 - Stock technical indicators such as RSI, MACD, BBANDS, STOCH, VWAP, moving averages, and related indicator series.
 
@@ -56,6 +56,7 @@ Translate user intent to the correct endpoint:
 - "Balance Sheet" -> `/api/stock/{ticker}/balance-sheets`
 - "Cash Flow" -> `/api/stock/{ticker}/cash-flows`
 - "Earnings History" -> `/api/stock/{ticker}/earnings`
+- "Analyst Ratings" / "Upgrades" / "Downgrades" -> `/api/screener/analysts`
 - "Technical Indicator" / "RSI" / "MACD" / "Moving Average" -> `/api/stock/{ticker}/technical-indicator/{function}`
 
 ## Valid Endpoint Reference
@@ -96,6 +97,10 @@ You must choose the endpoint from this list.
 - **Insider Trading:** `/api/insider/transactions`
 - **Politician Trades:** `/api/congress/recent-trades`
 - **News:** `/api/news/headlines`
+- **Analyst Ratings:** `/api/screener/analysts`
+  - _Params:_ `ticker` (one symbol), `action` (`initiated`, `reiterated`, `downgraded`, `upgraded`, `maintained`), `recommendation` (`buy`, `hold`, `sell`), `newer_than`, `older_than` (Unix ms/s, ISO date, or RFC3339), `limit` (max 500)
+  - Response `data` rows include `action` (also `target raised` and `target lowered`), `analyst_name`, `firm`, `recommendation`, `target`, `ticker`, and `timestamp`.
+  - _Trade-frame watchlist:_ the Analysts column is upgrades minus downgrades from a fixed name list over 60 days (`app/services/analysts.py`). One call per symbol (`ticker` + `newer_than` + `limit=500`); action and name filtering happens in that module, not in the query.
 
 ### Financial Statements & Technicals
 

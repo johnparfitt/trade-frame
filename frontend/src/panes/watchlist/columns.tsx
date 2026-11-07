@@ -10,7 +10,7 @@ import {
   type WatchlistRow,
 } from "../../api";
 import type { SortKey } from "./sort";
-import { useDismissedFilings, useSeenFilings } from "./useSeenFilings";
+import { useDismissedFilings, useSeenFilings, useSeenUpgrades } from "./useSeenFilings";
 
 export interface Column {
   key: SortKey;
@@ -102,6 +102,41 @@ function significanceClass(direction: string | null, score: number | null): stri
     default:
       return strong ? "text-amber-300" : "text-amber-400";
   }
+}
+
+function analystClass(v: number | null): string {
+  if (v == null) return "text-slate-500";
+  if (v > 0) return "text-emerald-400";
+  if (v < 0) return "text-rose-400";
+  return "text-white";
+}
+
+function fmtAnalyst(v: number): string {
+  return v > 0 ? `+${v}` : String(v);
+}
+
+// Analysts cell: upgrades minus downgrades over 60 days. A pulsing dot means
+// an upgrade in that window has not been acknowledged. Clicking the number
+// marks every current upgrade for this symbol seen; the number stays.
+// Downgrades never light the dot. A failed lookup stays a dash.
+function AnalystCell({ row }: { row: WatchlistRow }) {
+  const { isSeen, markSeenMany } = useSeenUpgrades();
+  const ids = row.analyst_upgrades ?? [];
+  const unseen = ids.some((id) => !isSeen(id));
+  if (row.analyst_net == null) return <>—</>;
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center justify-end gap-1"
+      aria-label={unseen ? "Acknowledge analyst upgrades" : "Analyst upgrades minus downgrades"}
+      onClick={() => markSeenMany(ids)}
+    >
+      {unseen ? (
+        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400" aria-hidden />
+      ) : null}
+      {fmtAnalyst(row.analyst_net)}
+    </button>
+  );
 }
 
 const RECENT_DAYS = 7;
@@ -618,14 +653,6 @@ export const ALL_COLUMNS: Column[] = [
     cellClassName: () => "text-slate-300",
   },
   {
-    key: "float_pct",
-    label: "Float%",
-    numeric: true,
-    width: 84,
-    render: (r) => fmtPctOne(r.float_pct),
-    cellClassName: () => "text-slate-300",
-  },
-  {
     key: "short_pct_float",
     label: "Float Short",
     numeric: true,
@@ -658,6 +685,15 @@ export const ALL_COLUMNS: Column[] = [
     width: 92,
     render: (r) => fmtEarnings(r.next_earnings).label,
     cellClassName: (r) => (fmtEarnings(r.next_earnings).soon ? "text-amber-400" : "text-slate-300"),
+  },
+  {
+    key: "analyst_net",
+    label: "Analysts",
+    numeric: true,
+    width: 80,
+    render: (r) => <AnalystCell row={r} />,
+    cellClassName: (r) => analystClass(r.analyst_net),
+    title: () => "Upgrades minus downgrades from the tracked analysts, last 60 days",
   },
   {
     key: "sec_significance",

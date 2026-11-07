@@ -42,10 +42,11 @@ export interface WatchlistRow {
   atr_pct_50: number | null;
   adr_pct: number | null;
   float_shares: number | null;
-  float_pct: number | null;
   short_pct_float: number | null;
   days_to_cover: number | null;
   gamma_magnet: number | null;
+  analyst_net: number | null;
+  analyst_upgrades: string[];
   sec_filing_url: string | null;
   sec_filing_form: string | null;
   sec_filing_date: string | null;

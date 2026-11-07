@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # costs one Unusual Whales call per symbol.
     gex_cache_ttl: int = 900
 
+    # In-memory cache TTL (seconds) for the watchlist Analysts column. Longer
+    # than the snapshot TTL because each miss is one Unusual Whales call per
+    # symbol.
+    analyst_cache_ttl: int = 3600
+
     # SEC EDGAR (watchlist SEC column). Free, no key,
     # but EDGAR requires a descriptive User-Agent with contact info and caps
     # callers at 10 req/s — set TF_SEC_USER_AGENT to your own contact.
